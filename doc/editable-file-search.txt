@@ -1,0 +1,97 @@
+*editable-file-search.txt*
+
+Author: Yogesh Dhamija <yogeshdhamija@outlook.com>
+
+This plugin provides |:FileSearch|, which turns the current window into a
+fuzzy search of the files under the current directory -- as a plain, editable
+buffer. Type a query and the results update as you go, as in fzf; then whittle
+them down with ordinary editing, the way you would any other text.
+
+Requires Neovim and ripgrep (`rg`).
+
+						*:FileSearch*
+:FileSearch [query]	Search the files under the current directory, in this
+			window, starting in Insert mode on the query. [query]
+			prefills it.
+
+The buffer looks like this: >
+
+	Query: init nvim
+	Results: 2 matches among 4,210 files in ~/Stuff   <CR> opens · ...
+	.config/nvim/init.vim
+	.vim/plugged/nvim-nio/tests/init.vim
+<
+Line 1 is the query. Every line below it is a result: a path relative to the
+directory searched. Both are ordinary text, so anything that edits text works
+on them, yanking and pasting included. "Query:" and the "Results:" line are
+not text -- they are drawn by the plugin (|extmarks|) -- so they cannot be
+deleted or yanked, or mistaken for a path.
+
+Changing line 1 runs the query over every file again and redraws the results.
+Matching is |matchfuzzy()|'s: the query's characters must appear in order,
+and a query of several words keeps only results matching all of them. The
+characters each visible result matched on are highlighted.
+
+Nothing but line 1 is ever redrawn, so the results can be narrowed by hand
+and stay that way: `dd`, `d}`, `:g/test/d`, `:v/lua/d`, |:Narrow|. Once the
+results are anything other than exactly what the query gives, the query is
+marked "Query (Note: NARROWED):" and the "Results:" line says how many are
+left. Editing the query starts over from every file again.
+
+`u` undoes as usual, a step at a time: a query together with its results, or
+one narrowing. Undo puts back the results as they were at that point, rather
+than searching afresh, so undoing an edit to the query brings back any
+narrowing that edit threw away. `CTRL-R` redoes.
+
+						*:Narrow*
+:Narrow {words}		Keep only the results that fuzzy-match {words}, in
+			the order they were in. Only in a |:FileSearch|
+			buffer. Repeat it to narrow further; `u` undoes one
+			at a time.
+
+<CR> opens the file on the cursor line in this window. On the query line,
+from Normal or Insert mode, it opens the top result. Paths are relative to
+the directory searched, not the current directory, so they still open after
+a |:cd|; |gf| and CTRL-W_f work on them too. A line typed or pasted in as an
+absolute path opens as it is.
+
+Opening a result is a jump, so CTRL-O comes back to the search with the
+cursor where it was and the results as they were. The search buffer is
+listed, so it shows in |:ls| and can be reached with |:buffer| as well.
+
+There is one search per directory, named `filesearch://` followed by the
+directory. |:FileSearch| reuses it, if it exists: the file list is fetched
+again, so new files show up, and the old search is replaced by a fresh one.
+The replacement is an ordinary change, so `u` brings the old search back.
+
+The buffer is 'buftype' nofile and 'bufhidden' hide: there is nothing to
+save, and it is kept rather than wiped when hidden, because a wiped buffer has
+its |jumplist| entries dropped along with it. The name is also what lets it
+survive |:mksession|: entering a search buffer restored from a session sets it
+up as a fresh search of that directory.
+
+Line 1 is always the query. Deleting it makes the first result the query,
+which searches for that path; `u` puts it back.
+
+The search runs inside Neovim, on every key typed into the query. That is
+instant for a project, but on a very large tree (a home directory, say, with
+hundreds of thousands of files) each key takes a noticeable fraction of a
+second.
+
+					*g:editable_file_search_command*
+The command that lists the files, as a list. It is run in the directory
+searched, and should print one path per line, relative to it. The default
+finds what `rg --files` does, plus hidden files, following symlinks, and
+leaving out the inside of .git directories: >
+	let g:editable_file_search_command =
+		\ ['rg', '--files', '--hidden', '--follow', '--no-messages', '--glob=!.git/']
+<
+						*editable-file-search-highlights*
+The colors come from these groups, each linked by default as shown:
+
+	FileSearchLabel		"Query:" and "Results:"		|hl-Title|
+	FileSearchNarrowed	"(Note: NARROWED)"		|hl-WarningMsg|
+	FileSearchSummary	the hints after the counts	|hl-Comment|
+	FileSearchMatch		matched characters		|hl-Special|
+
+ vim:tw=78:ts=8:noet:ft=help:norl:
