@@ -7,7 +7,9 @@ if vim.g.loaded_editable_file_search then
 end
 vim.g.loaded_editable_file_search = 1
 
-vim.api.nvim_create_user_command('FileSearch', function(opts)
+-- All capitals, like the commands of a search buffer, so that a short
+-- abbreviation is less likely to be ambiguous (:help user-cmd-ambiguous)
+vim.api.nvim_create_user_command('FILESEARCH', function(opts)
   require('editable-file-search').open(opts.args)
 end, { nargs = '*', bar = true, desc = 'Fuzzy-search files under the cwd in an editable buffer' })
 

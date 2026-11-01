@@ -7,12 +7,16 @@
 --
 -- Changing line 1 runs the query over the whole file list again and redraws
 -- the results. Nothing else is ever redrawn, so the results can be whittled
--- down by hand -- dd, :g/foo/d, :v/foo/d, :Narrow -- and stay that way until
+-- down by hand -- dd, :g/foo/d, :v/foo/d, :NARROW -- and stay that way until
 -- the query changes. Undo and redo are taken as they come: they put back text
 -- that was right at the time, narrowing included (see M.sync).
 --
--- The labels ("Query:", the result counts) are extmarks, not text, so they
--- can't be deleted or yanked, or read back as a path.
+-- The file list comes from a command and some flags. :CHANGEFLAGS lists the
+-- files again with other flags, in the same buffer, and starts the results
+-- and undo over (see M.change_flags).
+--
+-- The labels ("Query:", the command, the result counts) are extmarks, not
+-- text, so they can't be edited, deleted or yanked, or read back as a path.
 
 local M = {}
 
@@ -20,17 +24,120 @@ local scheme = 'filesearch://'
 local ns = vim.api.nvim_create_namespace('editable-file-search')
 local match_ns = vim.api.nvim_create_namespace('editable-file-search-match')
 
--- Hidden files and symlinks in, but not the inside of .git, which --hidden
--- would otherwise let in too.
-local default_command = { 'rg', '--files', '--hidden', '--follow', '--no-messages', '--glob=!.git/' }
+-- The part of the command :CHANGEFLAGS leaves alone. --files has rg list the
+-- files rather than search them.
+local default_command = { 'rg', '--files', '--no-messages' }
+
+-- The flags :CHANGEFLAGS asks about, in this order, and whether a new search
+-- starts with them: hidden files and symlinks in, but not the inside of .git,
+-- which --hidden would otherwise let in too.
+local default_prompts = {
+  { flag = '--hidden', default = true },
+  { flag = '--glob=!.git/', default = true },
+  { flag = '--no-ignore', default = false },
+  { flag = '--follow', default = true },
+}
 
 -- Keyed by buffer number:
 --   root     the directory searched; results are relative to it
+--   command, flags  what listed the files, as lists of words
 --   files    every file under root, sorted
 --   query    the query the results were last drawn for
 --   matches  the results that query gives, before any narrowing
 --   seq_last, seq_cur  the undo state as of the last sync, to tell undo from edits
 local state = {}
+
+-- A command or a flag is a list of words, taken as they are, or a string,
+-- split into words at whitespace. It's run without a shell, so there is no
+-- quoting: a word with a space in it needs the list.
+local function words(value)
+  if type(value) == 'string' then
+    return vim.split(value, '%s+', { trimempty = true })
+  end
+  return vim.deepcopy(value or {})
+end
+
+local function command()
+  return words(vim.g.editable_file_search_command or default_command)
+end
+
+-- From Vimscript, a default can come as 1 or 0 as well as v:true or v:false
+local function prompts()
+  local list = {}
+  for _, prompt in ipairs(vim.g.editable_file_search_flag_prompts or default_prompts) do
+    local flag = words(prompt.flag)
+    if #flag > 0 then
+      table.insert(list, { flag = flag, default = prompt.default == true or prompt.default == 1 })
+    end
+  end
+  return list
+end
+
+-- A flag can be more than one word, -g !.git/ say. Having it means having
+-- its words together and in order, as whole words: --no-ignore-vcs doesn't
+-- count as --no-ignore.
+local function at(flags, flag, i)
+  for j = 1, #flag do
+    if flags[i + j - 1] ~= flag[j] then
+      return false
+    end
+  end
+  return #flag > 0
+end
+
+local function has(flags, flag)
+  for i = 1, #flags do
+    if at(flags, flag, i) then
+      return true
+    end
+  end
+  return false
+end
+
+local function with(flags, flag)
+  if has(flags, flag) then
+    return flags
+  end
+  return vim.list_extend(vim.deepcopy(flags), flag)
+end
+
+-- Every time it appears
+local function without(flags, flag)
+  local kept, i = {}, 1
+  while i <= #flags do
+    if at(flags, flag, i) then
+      i = i + #flag
+    else
+      table.insert(kept, flags[i])
+      i = i + 1
+    end
+  end
+  return kept
+end
+
+-- The words after :CHANGEFLAGS, as flags: a word starting with -, and the
+-- words after it that don't, which are its values. -g !.git/ --hidden is two.
+local function split_flags(args)
+  local flags = {}
+  for _, word in ipairs(args) do
+    if #flags == 0 or vim.startswith(word, '-') then
+      table.insert(flags, { word })
+    else
+      table.insert(flags[#flags], word)
+    end
+  end
+  return flags
+end
+
+local function default_flags()
+  local flags = {}
+  for _, prompt in ipairs(prompts()) do
+    if prompt.default then
+      flags = with(flags, prompt.flag)
+    end
+  end
+  return flags
+end
 
 local function find_buffer(name)
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
@@ -60,21 +167,33 @@ local function root_of(buf)
   return root ~= '' and vim.fs.normalize(root) or vim.fn.getcwd()
 end
 
-local function list_files(root)
-  local cmd = vim.g.editable_file_search_command or default_command
-  -- vim.system throws, rather than returning an error, when cmd[1] isn't installed
+-- Every file under root, as the command and flags list them, sorted. If the
+-- command fails, nil and why.
+local function list_files(root, cmd, flags)
+  local argv = vim.list_extend(vim.deepcopy(cmd), flags)
+  -- vim.system throws, rather than returning an error, when argv[1] isn't installed
   local ok, result = pcall(function()
-    return vim.system(cmd, { cwd = root, text = true }):wait()
+    return vim.system(argv, { cwd = root, text = true }):wait()
   end)
   if not ok then
-    vim.notify('editable-file-search: could not run ' .. cmd[1] .. ': ' .. result, vim.log.levels.ERROR)
-    return {}
+    return nil, 'could not run ' .. tostring(argv[1]) .. ': ' .. result
   end
   local files = vim.split(result.stdout or '', '\n', { trimempty = true })
+  -- Failed only if it listed nothing and says why: rg exits 1 when there are
+  --   no files at all, and 2 when it listed what it could but couldn't read
+  --   some directory -- which --no-messages keeps quiet about
+  local err = vim.trim(result.stderr or '')
+  if result.code ~= 0 and #files == 0 and err ~= '' then
+    return nil, err
+  end
   -- rg walks the tree in parallel, so its order changes from run to run.
   --   matchfuzzy breaks ties in list order, so this keeps those stable too.
   table.sort(files)
   return files
+end
+
+local function fail(err)
+  vim.notify('editable-file-search: ' .. err, vim.log.levels.ERROR)
 end
 
 local function searching(query)
@@ -133,12 +252,20 @@ local function summary(st, shown, narrowed)
   if narrowed then
     return count(shown) .. ' left of ' .. from, '   u undoes · editing the query starts over'
   end
-  return from, '   <CR> opens · :Narrow {words} narrows'
+  return from, '   <CR> opens · :NARROW {text} narrows fuzzily'
+end
+
+-- The command as it was run. A word with a space in it is quoted, or it would
+-- read as more than one.
+local function command_line(st)
+  return table.concat(vim.tbl_map(function(word)
+    return (word == '' or word:find('%s')) and vim.fn.shellescape(word) or word
+  end, vim.list_extend(vim.deepcopy(st.command), st.flags)), ' ')
 end
 
 -- Redraws the labels from what the buffer says now. The results count as
 -- narrowed whenever they are not exactly what the query gives -- however they
--- got that way: :Narrow, dd, :g/foo/d, a paste, or undoing back to any of those.
+-- got that way: :NARROW, dd, :g/foo/d, a paste, or undoing back to any of those.
 local function decorate(buf)
   local st = state[buf]
   local shown = results(buf)
@@ -153,7 +280,10 @@ local function decorate(buf)
     virt_text_pos = 'inline',
     -- Text typed at the start of the query goes after the label, not before it
     right_gravity = false,
-    virt_lines = { { { 'Results: ' .. text, 'FileSearchLabel' }, { hint, 'FileSearchSummary' } } },
+    virt_lines = {
+      { { 'Command: ' .. command_line(st), 'FileSearchLabel' }, { '   change with :CHANGEFLAGS', 'FileSearchSummary' } },
+      { { 'Results: ' .. text, 'FileSearchLabel' }, { hint, 'FileSearchSummary' } },
+    },
   })
   -- 'nofile' already keeps it from blocking :quit, but :bdelete through
   --   mini.bufremove asks to save anything 'modified'
@@ -229,18 +359,97 @@ function M.open_under_cursor()
   vim.cmd('edit ' .. vim.fn.fnameescape(path))
 end
 
--- Keeps only the results that fuzzy-match {words}, in the order they were in.
-function M.narrow(buf, words)
+-- Keeps only the results that fuzzy-match {text}, in the order they were in.
+function M.narrow(buf, text)
   M.sync(buf)
   local shown = results(buf)
   local keep = {}
-  for _, line in ipairs(vim.fn.matchfuzzy(shown, words)) do
+  for _, line in ipairs(vim.fn.matchfuzzy(shown, text)) do
     keep[line] = true
   end
   set_results(buf, vim.tbl_filter(function(line)
     return keep[line] ~= nil
   end, shown))
   M.sync(buf)
+end
+
+-- Asks about each flag prompt in turn: always all of them, in the same order,
+-- so that the answers can be typed ahead from memory, yyny say. y adds the
+-- flag, n takes it out, and Enter leaves it as it is. Returns the flags the
+-- answers make, or nil if cancelled.
+local function ask(flags)
+  local list = prompts()
+  for i, prompt in ipairs(list) do
+    local on = has(flags, prompt.flag)
+    local question = ('(%d/%d) %s? %s '):format(i, #list, table.concat(prompt.flag, ' '), on and '[Y/n]' or '[y/N]')
+    vim.api.nvim_echo({ { question, 'Question' } }, false, {})
+    local answer
+    repeat
+      -- CTRL-C can come as an interrupt rather than a key
+      local ok, key = pcall(vim.fn.getcharstr)
+      if not ok or key == '\27' or key == '\3' then
+        vim.api.nvim_echo({ { '' } }, false, {})
+        return nil
+      elseif key == 'y' or key == 'Y' then
+        answer = true
+      elseif key == 'n' or key == 'N' then
+        answer = false
+      elseif key == '\r' or key == '\n' then
+        answer = on
+      end
+    until answer ~= nil
+    flags = answer and with(flags, prompt.flag) or without(flags, prompt.flag)
+  end
+  vim.api.nvim_echo({ { '' } }, false, {})
+  return flags
+end
+
+-- Lists the files again with other flags, for :CHANGEFLAGS: with bang,
+-- exactly {args}; else {args} added to the flags there are, any already there
+-- skipped; or, with no {args}, whatever the answers to the flag prompts make
+-- them. With the same flags, it lists the files again all the same.
+--
+-- It is the same search still, in the same buffer, so the jumplist, marks and
+-- the alternate file all still lead to it. But the query is matched afresh
+-- against the new file list, narrowing gone, and undo starts over too: every
+-- step of it is text from the old list, which matching against the new one
+-- would no longer agree with.
+function M.change_flags(buf, args, bang)
+  local st = state[buf]
+  if not st then
+    return
+  end
+  local flags
+  if bang then
+    flags = vim.deepcopy(args)
+  elseif #args > 0 then
+    flags = st.flags
+    for _, flag in ipairs(split_flags(args)) do
+      flags = with(flags, flag)
+    end
+  else
+    flags = ask(st.flags)
+    if not flags then
+      return
+    end
+  end
+
+  M.sync(buf)
+  local cmd = command()
+  local files, err = list_files(st.root, cmd, flags)
+  if not files then
+    fail(err)
+    return
+  end
+  st.command, st.flags, st.files = cmd, flags, files
+  st.matches = match(files, st.query)
+  -- A change made with 'undolevels' at -1 clears undo (:help clear-undo)
+  local undolevels = vim.bo[buf].undolevels
+  vim.bo[buf].undolevels = -1
+  vim.api.nvim_buf_set_lines(buf, 1, -1, false, st.matches)
+  vim.bo[buf].undolevels = undolevels
+  remember_undo_state(buf)
+  decorate(buf)
 end
 
 -- Sets up a buffer named filesearch://<n><dir> as a search of <dir>. Called
@@ -257,8 +466,15 @@ function M.setup(buf)
   -- So gf, CTRL-W f and friends find results even after a :cd
   vim.bo[buf].path = (root:gsub('[, \\]', '\\%0'))
 
-  local files = list_files(root)
-  state[buf] = { root = root, files = files, query = '', matches = files }
+  -- A search restored from a session starts with the default flags too: the
+  --   name only says what directory it was of
+  local cmd, flags = command(), default_flags()
+  local files, err = list_files(root, cmd, flags)
+  if not files then
+    fail(err)
+    files = {}
+  end
+  state[buf] = { root = root, command = cmd, flags = flags, files = files, query = '', matches = files }
 
   -- Kept out of undo: the first text isn't an edit, and u should never be
   --   able to empty the buffer
@@ -295,9 +511,14 @@ function M.setup(buf)
     end
     return '<CR>'
   end, { buffer = buf, expr = true, desc = 'Open top result from the query line' })
-  vim.api.nvim_buf_create_user_command(buf, 'Narrow', function(opts)
+  -- All capitals, so that a short abbreviation is less likely to be
+  --   ambiguous (:help user-cmd-ambiguous)
+  vim.api.nvim_buf_create_user_command(buf, 'NARROW', function(opts)
     M.narrow(buf, opts.args)
-  end, { nargs = '+', desc = 'Keep only the results that fuzzy-match {words}' })
+  end, { nargs = '+', desc = 'Keep only the results that fuzzy-match {text}' })
+  vim.api.nvim_buf_create_user_command(buf, 'CHANGEFLAGS', function(opts)
+    M.change_flags(buf, opts.fargs, opts.bang)
+  end, { nargs = '*', bang = true, desc = 'List the files again with other flags' })
 
   vim.bo[buf].filetype = 'filesearch'
   remember_undo_state(buf)
