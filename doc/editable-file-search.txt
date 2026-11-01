@@ -12,7 +12,16 @@ Requires Neovim and ripgrep (`rg`).
 						*:FileSearch*
 :FileSearch [query]	Search the files under the current directory, in this
 			window, starting in Insert mode on the query. [query]
-			prefills it.
+			prefills it. Each time is a new search, in a buffer of
+			its own; see |editable-file-search-buffers|.
+
+					*editable-file-search.open()*
+require('editable-file-search').open([{query}])
+			The same, from Lua. Pass a query from a script, a
+			Visual selection say, this way rather than through
+			|:FileSearch|: the command line would take a `|` or `"`
+			in it as the end of the command. A query of several
+			lines is joined into one, with spaces.
 
 The buffer looks like this: >
 
@@ -59,10 +68,14 @@ Opening a result is a jump, so CTRL-O comes back to the search with the
 cursor where it was and the results as they were. The search buffer is
 listed, so it shows in |:ls| and can be reached with |:buffer| as well.
 
-There is one search per directory, named `filesearch://` followed by the
-directory. |:FileSearch| reuses it, if it exists: the file list is fetched
-again, so new files show up, and the old search is replaced by a fresh one.
-The replacement is an ordinary change, so `u` brings the old search back.
+					*editable-file-search-buffers*
+Each search is a buffer of its own, named `filesearch://` followed by a
+number and the directory searched: `filesearch://1/home/me/project`, then
+`filesearch://2/home/me/project` for the next search there, and so on. Every
+|:FileSearch| starts a new one, with the file list fetched afresh, so new
+files show up. Earlier searches are left as they were, narrowing and all, so
+several can be open at once, side by side or one after another in the same
+window. They stay listed until |:bdelete|d.
 
 The buffer is 'buftype' nofile and 'bufhidden' hide: there is nothing to
 save, and it is kept rather than wiped when hidden, because a wiped buffer has

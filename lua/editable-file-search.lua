@@ -40,6 +40,26 @@ local function find_buffer(name)
   end
 end
 
+-- Every search is a buffer of its own, named filesearch://<n><directory>,
+-- where n tells apart searches of the same directory. Taken numbers are
+-- skipped: those of searches still around, hidden or unloaded (:bdelete)
+-- included, so that no new search lands in an old one's buffer.
+local function new_name(root)
+  local n = 1
+  while find_buffer(scheme .. n .. root) do
+    n = n + 1
+  end
+  return scheme .. n .. root
+end
+
+-- The directory a search buffer is named after. The directory is absolute,
+-- so it can't start with a digit. Names from before searches were numbered
+-- have no n, and read the same way.
+local function root_of(buf)
+  local root = vim.api.nvim_buf_get_name(buf):sub(#scheme + 1):gsub('^%d+', '', 1)
+  return root ~= '' and vim.fs.normalize(root) or vim.fn.getcwd()
+end
+
 local function list_files(root)
   local cmd = vim.g.editable_file_search_command or default_command
   -- vim.system throws, rather than returning an error, when cmd[1] isn't installed
@@ -223,11 +243,10 @@ function M.narrow(buf, words)
   M.sync(buf)
 end
 
--- Sets up a buffer named filesearch://<dir> as a search of <dir>. Called on
--- BufReadCmd, so this is also what rebuilds one restored from a session.
+-- Sets up a buffer named filesearch://<n><dir> as a search of <dir>. Called
+-- on BufReadCmd, so this is also what rebuilds one restored from a session.
 function M.setup(buf)
-  local root = vim.api.nvim_buf_get_name(buf):sub(#scheme + 1)
-  root = root ~= '' and vim.fs.normalize(root) or vim.fn.getcwd()
+  local root = root_of(buf)
 
   -- 'bufhidden' is hide rather than wipe because wiping drops a buffer's
   --   jumplist entries, and coming back with CTRL-O is the point
@@ -285,40 +304,32 @@ function M.setup(buf)
   decorate(buf)
 end
 
--- Starts a fresh search of the cwd in this window, prefilled with {query}.
+-- Starts a new search of the cwd in this window, prefilled with {query}.
 --
--- There is one search buffer per directory. If this one already exists it is
--- reused, its file list refreshed, and the old search replaced -- as an
--- ordinary change, so u brings the old search back.
+-- Each search is a buffer of its own, with its own file list, listed fresh.
+-- Earlier searches are left as they were, so several can be open at once.
 function M.open(query)
-  query = query or ''
-  local name = scheme .. vim.fn.getcwd()
-  local buf = find_buffer(name)
-  local existing = buf ~= nil and state[buf] ~= nil
-  if buf == nil then
-    vim.cmd('edit ' .. vim.fn.fnameescape(name))
-  elseif buf ~= vim.api.nvim_get_current_buf() then
-    -- Not loaded (restored from a session, say), :buffer reads it in again
-    vim.cmd('buffer ' .. buf)
-  end
-  buf = vim.api.nvim_get_current_buf()
+  -- A line of the buffer can't hold a newline, so a query of several lines
+  --   (a Visual selection, say) is joined into one
+  query = (query or ''):gsub('\n', ' ')
+  -- :edit, unlike nvim_win_set_buf, records the jump, so CTRL-O goes back to
+  --   whatever was here before
+  vim.cmd('edit ' .. vim.fn.fnameescape(new_name(vim.fn.getcwd())))
+  local buf = vim.api.nvim_get_current_buf()
+  -- Reading the new name set it up already, unless autocommands were off
   if not state[buf] then
     M.setup(buf)
   end
-  local st = state[buf]
-  if existing then
-    -- A new buffer listed them just now
-    st.files = list_files(st.root)
-  end
 
-  st.query = query
-  st.matches = match(st.files, query)
-  local lines = vim.list_extend({ query }, st.matches)
-  if not same(vim.api.nvim_buf_get_lines(buf, 0, -1, false), lines) then
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  -- An ordinary change, as if typed, so u takes it back to the empty query
+  if query ~= '' then
+    local st = state[buf]
+    st.query = query
+    st.matches = match(st.files, query)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend({ query }, st.matches))
+    remember_undo_state(buf)
+    decorate(buf)
   end
-  remember_undo_state(buf)
-  decorate(buf)
 
   vim.api.nvim_win_set_cursor(0, { 1, #query })
   vim.cmd('startinsert!')

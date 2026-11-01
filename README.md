@@ -1,6 +1,6 @@
 # editable-file-search.nvim
 
-Fuzzy file search in a plain, editable Neovim buffer. Type a query and the results update as you go, as in fzf; then narrow them with ordinary editing (`dd`, `:g/test/d`, `:v/lua/d`) or `:Narrow {words}`, undo with `u`, and open one with `<CR>`. The search buffer is listed and in the jumplist, so you can open a result, look, and `CTRL-O` back to the search as you left it.
+Fuzzy file search in a plain, editable Neovim buffer. Type a query and the results update as you go, as in fzf; then narrow them with ordinary editing (`dd`, `:g/test/d`, `:v/lua/d`) or `:Narrow {words}`, undo with `u`, and open one with `<CR>`. Each search is a buffer of its own, listed and in the jumplist, so you can keep several open at once, or open a result, look, and `CTRL-O` back to the search as you left it.
 
 ```
 Query (Note: NARROWED): init

@@ -13,7 +13,7 @@ end, { nargs = '*', bar = true, desc = 'Fuzzy-search files under the cwd in an e
 
 local group = vim.api.nvim_create_augroup('EditableFileSearch', {})
 
--- Every search buffer is named filesearch://<directory searched>, and is
+-- Every search buffer is named filesearch://<n><directory searched>, and is
 -- built by reading that name, the way oil.nvim builds oil:// buffers. That is
 -- what makes it survive :mksession: the session restores the name with :badd,
 -- and entering the buffer reads it here into a working search again, rather
