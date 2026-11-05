@@ -15,8 +15,9 @@
 -- files again with other flags, in the same buffer, and starts the results
 -- and undo over (see M.change_flags).
 --
--- The labels ("Query:", the command, the result counts) are extmarks, not
--- text, so they can't be edited, deleted or yanked, or read back as a path.
+-- The labels ("Query:", the command, the result counts, the rule under them)
+-- are extmarks, not text, so they can't be edited, deleted or yanked, or read
+-- back as a path.
 
 local M = {}
 
@@ -281,8 +282,17 @@ local function decorate(buf)
     -- Text typed at the start of the query goes after the label, not before it
     right_gravity = false,
     virt_lines = {
-      { { 'Command: ' .. command_line(st), 'FileSearchLabel' }, { '   change with :CHANGEFLAGS', 'FileSearchSummary' } },
-      { { 'Results: ' .. text, 'FileSearchLabel' }, { hint, 'FileSearchSummary' } },
+      {
+        { 'Command: ', 'FileSearchLabel' },
+        { command_line(st), 'FileSearchText' },
+        { '   change with :CHANGEFLAGS', 'FileSearchSummary' },
+      },
+      { { 'Results: ', 'FileSearchLabel' }, { text, 'FileSearchText' }, { hint, 'FileSearchSummary' } },
+      -- A rule under it all, so the results read as apart from the header.
+      --   As wide as the screen, which no window is wider than: a virtual
+      --   line is cut off at the window's edge, so it fits every window the
+      --   buffer is in, whatever their widths
+      { { ('─'):rep(vim.o.columns), 'FileSearchSeparator' } },
     },
   })
   -- 'nofile' already keeps it from blocking :quit, but :bdelete through
@@ -491,6 +501,13 @@ function M.setup(buf)
       M.sync(buf)
     end,
   })
+  -- The rule under the header is as wide as the screen was when drawn
+  vim.api.nvim_create_autocmd('VimResized', {
+    group = group,
+    callback = function()
+      decorate(buf)
+    end,
+  })
   -- Unloading (:bdelete) empties the buffer; entering it again reads it, and
   --   so sets it up, afresh
   vim.api.nvim_create_autocmd('BufUnload', {
@@ -557,24 +574,39 @@ function M.open(query)
 end
 
 vim.api.nvim_set_decoration_provider(match_ns, {
-  -- Highlights where each visible result matched the query. Worked out per
-  -- redraw for just the lines on screen: marking every match up front would
-  -- mean one extmark per matched character across the whole file list.
+  -- Dims the directory of each visible result, and highlights where it
+  -- matched the query. Worked out per redraw for just the lines on screen:
+  -- marking every match up front would mean one extmark per matched character
+  -- across the whole file list.
   on_win = function(_, _, buf, toprow, botrow)
     local st = state[buf]
-    if not st or not searching(st.query) then
+    if not st then
       return false
     end
     local first = math.max(toprow, 1)
     for i, line in ipairs(vim.api.nvim_buf_get_lines(buf, first, botrow + 1, false)) do
-      -- matchfuzzypos drops non-matches, so one line at a time keeps rows straight
-      local hit = vim.fn.matchfuzzypos({ line }, st.query)[2][1] or {}
-      for _, char in ipairs(hit) do
-        vim.api.nvim_buf_set_extmark(buf, match_ns, first + i - 1, vim.fn.byteidx(line, char), {
-          end_col = vim.fn.byteidx(line, char + 1),
-          hl_group = 'FileSearchMatch',
+      local row = first + i - 1
+      -- Up to and including the last slash
+      local slash = line:match('^.*()/')
+      if slash then
+        vim.api.nvim_buf_set_extmark(buf, match_ns, row, 0, {
+          end_col = slash,
+          hl_group = 'FileSearchDirectory',
+          -- Under the match highlights, which take the default of 4096
+          priority = 4000,
           ephemeral = true,
         })
+      end
+      if searching(st.query) then
+        -- matchfuzzypos drops non-matches, so one line at a time keeps rows straight
+        local hit = vim.fn.matchfuzzypos({ line }, st.query)[2][1] or {}
+        for _, char in ipairs(hit) do
+          vim.api.nvim_buf_set_extmark(buf, match_ns, row, vim.fn.byteidx(line, char), {
+            end_col = vim.fn.byteidx(line, char + 1),
+            hl_group = 'FileSearchMatch',
+            ephemeral = true,
+          })
+        end
       end
     end
     return false

@@ -28,10 +28,16 @@ vim.api.nvim_create_autocmd('BufReadCmd', {
   end,
 })
 
+-- The labels are Identifier rather than Title, which nvim's own colorscheme
+-- makes the same color as the text, only bold. The text after them is left
+-- plain, and directories dimmed, so that the labels and file names stand out.
 local function set_highlights()
-  vim.api.nvim_set_hl(0, 'FileSearchLabel', { link = 'Title', default = true })
+  vim.api.nvim_set_hl(0, 'FileSearchLabel', { link = 'Identifier', default = true })
+  vim.api.nvim_set_hl(0, 'FileSearchText', { link = 'Normal', default = true })
   vim.api.nvim_set_hl(0, 'FileSearchNarrowed', { link = 'WarningMsg', default = true })
   vim.api.nvim_set_hl(0, 'FileSearchSummary', { link = 'Comment', default = true })
+  vim.api.nvim_set_hl(0, 'FileSearchSeparator', { link = 'Comment', default = true })
+  vim.api.nvim_set_hl(0, 'FileSearchDirectory', { link = 'Comment', default = true })
   vim.api.nvim_set_hl(0, 'FileSearchMatch', { link = 'Special', default = true })
 end
 set_highlights()

@@ -177,6 +177,18 @@ is(mode(), 'i', 'it starts in Insert mode, on the query')
 is(labels(), { 0, 0, 'Query: ', 'Results: all 7 files in ' .. vim.fn.fnamemodify(work, ':~')
   .. '   <CR> opens · :NARROW {text} narrows fuzzily',
   'Command: ' .. default_command .. '   change with :CHANGEFLAGS' }, 'the labels read as a fresh search')
+is(lua([[
+  local ns = vim.api.nvim_get_namespaces()['editable-file-search']
+  local d = vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, { details = true })[1][4]
+  return vim.tbl_map(function(chunks)
+    return vim.tbl_map(function(c) return c[2] end, chunks)
+  end, { d.virt_text, d.virt_lines[1], d.virt_lines[2], d.virt_lines[3] })
+]]), {
+  { 'FileSearchLabel' },
+  { 'FileSearchLabel', 'FileSearchText', 'FileSearchSummary' },
+  { 'FileSearchLabel', 'FileSearchText', 'FileSearchSummary' },
+  { 'FileSearchSeparator' },
+}, 'the prefixes are highlighted apart from the text after them, and a rule is under it all')
 
 describe('typing a query searches as you go')
 type('in')
@@ -474,6 +486,52 @@ is(lines(), vim.list_extend({ '' }, all), 'as a search of that directory')
 type('ggAinit')
 is(results(), matches('init'), 'and it searches')
 type('<Esc>')
+
+describe('directories are dimmed, and matched characters highlighted over them')
+-- Colors no colorscheme has, to tell on screen which group drew a cell
+lua([[
+  vim.api.nvim_set_hl(0, 'FileSearchDirectory', { fg = 1 })
+  vim.api.nvim_set_hl(0, 'FileSearchMatch', { fg = 2 })
+]])
+-- A cell of the screen, as its text and the color it is drawn in. Row 0 is
+-- the query; 1 and 2 the Command and Results lines, 3 the rule under them;
+-- the results start at 4.
+local function cell(row, col)
+  return lua([[
+    vim.cmd('redraw')
+    local cell = vim.api.nvim__inspect_cell(1, ...)
+    return { cell[1], cell[2].foreground or 0 }
+  ]], row, col)
+end
+local function color(row, col)
+  return cell(row, col)[2]
+end
+ex('FILESEARCH')
+type('<Esc>')
+is({ color(4, 0), color(4, 7), color(4, 8) }, { 1, 1, 0 },
+  'a directory is dimmed up to its last slash, and the file name is not')
+is(color(5, 0), 0, 'a result with no directory is not dimmed at all')
+ex('FILESEARCH luainit')
+type('<Esc>')
+is(results(), { 'lua/init.lua' }, 'the one result')
+is({ color(4, 0), color(4, 3), color(4, 4), color(4, 8) }, { 2, 1, 2, 0 },
+  'matched characters show over the dimming, in the directory and out of it')
+lua([[
+  vim.api.nvim_set_hl(0, 'FileSearchDirectory', { link = 'Comment' })
+  vim.api.nvim_set_hl(0, 'FileSearchMatch', { link = 'Special' })
+]])
+
+describe('a rule sets the header apart from the results, in windows of any width')
+local columns = call('nvim_get_option_value', 'columns', {})
+is({ cell(3, 0)[1], cell(3, columns - 1)[1] }, { '─', '─' }, 'it runs across the window, edge to edge')
+ex('vsplit')
+local half = call('nvim_win_get_width', 0)
+is({ cell(3, half - 1)[1], cell(3, half)[1], cell(3, half + 1)[1] }, { '─', '│', '─' },
+  'side by side, it fills each window, up to the split between them')
+ex('only')
+ex('set columns=' .. (columns + 20))
+is({ cell(3, columns + 19)[1], cell(4, 0)[1] }, { '─', 'l' }, 'redrawn wider when the screen is, still one line')
+ex('set columns=' .. columns)
 
 describe('no errors along the way')
 is(call('nvim_get_vvar', 'errmsg'), '', 'v:errmsg is empty')
