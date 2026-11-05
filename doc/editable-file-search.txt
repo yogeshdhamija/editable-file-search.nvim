@@ -43,18 +43,35 @@ plugin (|extmarks|) -- so they cannot be edited, deleted or yanked, or
 mistaken for a path. The "Command:" line shows the command that listed the
 files, flags and all; see |:CHANGEFLAGS| to change them.
 
+The files are listed in the background, so a big directory doesn't hold up
+the editor. Until the list is in, the "Results:" line says "Loading…", and
+the query can be typed meanwhile. The results are then written all at once,
+for the query as it is by then: never part of them at a time.
+
 Changing line 1 runs the query over every file again and redraws the results.
-Matching is |matchfuzzy()|'s: the query's characters must appear in order,
-and a query of several words keeps only results matching all of them. The
-characters each visible result matched on are highlighted, and its directory
-dimmed, so that the file name stands out (see
-|editable-file-search-highlights|).
+A path matches if the query's characters appear in it in order; a query of
+several words keeps only results matching all of them, in any order. Case is
+ignored. The best matches come first: each matched character counts for more
+at the start of the path or right after a `/`, at the start of a word, or
+right after the character matched before it -- and most for that, so that
+`lib` puts `lib/x.so` before `lua/images/back.png`. Where a word could match
+in more than one place, it's taken as matching the last, so the file name
+wins over a directory of the same name. Equal matches go shorter path first,
+then in the order of the file list, which is sorted. The characters each
+visible result matched on are highlighted, and its directory dimmed, so that
+the file name stands out (see |editable-file-search-highlights|).
+
+The results are written a page of 1,000 at a time, so that a query matching
+most of a very large tree doesn't fill the buffer with all of it. When there
+are more, the "Results:" line says "first 1,000 of" how many; |:MORE| adds
+the next page.
 
 Nothing but line 1 is ever redrawn, so the results can be narrowed by hand
-and stay that way: `dd`, `d}`, `:g/test/d`, `:v/lua/d`, |:NARROW|. Once the
-results are anything other than exactly what the query gives, the query is
-marked "Query (Note: NARROWED):" and the "Results:" line says how many are
-left. Editing the query starts over from every file again.
+and stay that way: `dd`, `d}`, `:g/test/d`, `:v/lua/d`, |:NARROW|. These act on
+the results in the buffer, so on the pages shown. Once the results are
+anything other than exactly the first pages of what the query gives, the
+query is marked "Query (Note: NARROWED):" and the "Results:" line says how
+many are left. Editing the query starts over from every file again.
 
 `u` undoes as usual, a step at a time: a query together with its results, or
 one narrowing. Undo puts back the results as they were at that point, rather
@@ -65,7 +82,16 @@ narrowing that edit threw away. `CTRL-R` redoes.
 :NARROW {text}		Keep only the results that fuzzy-match {text}, in
 			the order they were in. Only in a |:FILESEARCH|
 			buffer. Repeat it to narrow further; `u` undoes one
-			at a time.
+			at a time. Like any other narrowing, it acts on the
+			results in the buffer: the pages shown, not the
+			pages after them.
+
+							*:MORE*
+:[count]MORE		Add [count] more pages of results, or one, at the
+:MORE [count]		end. Only in a |:FILESEARCH| buffer. They are the
+			pages after the last one with any result still
+			showing, so results taken out of a page stay out.
+			`u` takes them back.
 
 						*:CHANGEFLAGS*
 :CHANGEFLAGS		List the files again, with the flags made by answers
@@ -92,14 +118,17 @@ are, together and in order, as whole words: `--no-ignore-vcs` doesn't count as
 `--hidden`, though rg treats them the same.
 
 It is still the same search, in the same buffer, so the |jumplist|, marks and
-the alternate file all still lead to it, and the query is kept. But the
-results start over, as from an edit to the query, narrowing gone -- and so
-does undo: `u` can't take back a change of flags, nor anything before it. Run
-:CHANGEFLAGS again to change them back. With the flags as they were, it lists
-the files again all the same, so new ones show up.
+the alternate file all still lead to it, and the query is kept. But it starts
+over as a new search does: the results go at once, "Loading…" until the new
+list is in, and then come for the query as it is by then, narrowing gone.
+Undo starts over too, from when the results go: `u` can't take back a change
+of flags, nor anything before it. Run :CHANGEFLAGS again to change them back.
+With the flags as they were, it lists the files again all the same, so new
+ones show up.
 
 If the command fails -- given a flag rg doesn't know, say -- the error is
-shown and the search left as it was.
+shown and the search goes back to the flags and files it had, with the
+results redrawn for the query.
 
 <CR> opens the file on the cursor line in this window. On the query line,
 from Normal or Insert mode, it opens the top result. Paths are relative to
@@ -133,10 +162,15 @@ and so searches every file again. Deleting it with an Ex command -- `:g`, `:v`,
 `:v/lua/d` catches the query whenever it doesn't say "lua" itself. Anything
 deleted along with it stays deleted. `u` puts it all back.
 
+A new search starts from the empty query and every file: `u` takes back a
+query typed, or given to |:FILESEARCH|, while the files were being listed, as
+it would one typed after.
+
 The search runs inside Neovim, on every key typed into the query. That is
-instant for a project, but on a very large tree (a home directory, say, with
-hundreds of thousands of files) each key takes a noticeable fraction of a
-second.
+instant for a project; on a very large tree (a home directory, say, with
+hundreds of thousands of files) each key takes up to a tenth of a second or
+so, less as the query gets longer. Listing a tree that large can take a
+while, but only the search waits for it.
 
 					*g:editable_file_search_command*
 The command that lists the files, before any flags: a list of words, or a

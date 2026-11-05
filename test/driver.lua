@@ -13,6 +13,7 @@ local root = assert(os.getenv('EFS_ROOT'), 'run me through test/run.sh')
 local pass, fail = 0, 0
 local function out(s)
   io.stdout:write(s .. '\n')
+  io.stdout:flush()
 end
 local function describe(name)
   out('')
@@ -87,8 +88,29 @@ end
 local function lua(code, ...)
   return call('nvim_exec_lua', code, { ... })
 end
+-- Whether the search in this window is still listing its files
+local function loading()
+  return lua([[
+    local ns = vim.api.nvim_get_namespaces()['editable-file-search']
+    for _, mark in ipairs(ns and vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, { details = true }) or {}) do
+      local results = mark[4].virt_lines and mark[4].virt_lines[2]
+      if results and results[2] and results[2][1] == 'Loading…' then
+        return true
+      end
+    end
+    return false
+  ]])
+end
+-- The file list comes in in the background. Tests of what happens before it
+-- does turn this off. Not asked halfway through a command, gg say: nvim
+-- holds requests until the command is done, which it won't be until sent
+-- the rest of it.
+local wait_for_lists = true
 local function settle()
   vim.wait(60)
+  if wait_for_lists and not call('nvim_get_mode').blocking then
+    assert(vim.wait(5000, function() return not loading() end, 10), 'the file list never came in')
+  end
 end
 -- Keys are sent one at a time, a <...> key counting as one.
 local function type(keys)
@@ -145,8 +167,22 @@ local function labels()
     return { marks[1][2], marks[1][3], text(d.virt_text), text(d.virt_lines[2]), text(d.virt_lines[1]) }
   ]])
 end
+-- A number as the summary writes it, 2,345 say
+local function count_of(n)
+  return (tostring(n):reverse():gsub('(%d%d%d)', '%1,'):reverse():gsub('^,', ''))
+end
+-- What the plugin's own matching makes of {list}, best first
 local function matches(q, list)
-  return lua('return vim.fn.matchfuzzy(...)', list or all, q)
+  return lua([[
+    local match = require('editable-file-search.match')
+    local lines, q = ...
+    local result = match.search(match.list(match.sort_lines(table.concat(lines, '\n'))), q)
+    local out = {}
+    for r = 1, result.count do
+      out[r] = match.ranked(result, r)
+    end
+    return out
+  ]], list or all, q)
 end
 local function without(list, pattern)
   return vim.tbl_filter(function(f)
@@ -363,6 +399,7 @@ ex('only')
 describe('open() takes a query from Lua, whatever is in it')
 type('<Esc>')
 lua([[require('editable-file-search').open('lua\ninit')]])
+settle()
 is(query(), 'lua init', 'lines are joined into one query')
 is(results(), matches('lua init'), 'and searched')
 is(mode(), 'i', 'in Insert mode')
@@ -572,12 +609,108 @@ ex('set columns=' .. (columns + 20))
 is({ cell(3, columns + 19)[1], cell(4, 0)[1] }, { '─', 'l' }, 'redrawn wider when the screen is, still one line')
 ex('set columns=' .. columns)
 
+describe('results rank by how well they match')
+is(matches('b', { 'ab', 'a_b', 'a/b' }), { 'a/b', 'a_b', 'ab' },
+  'right after a / first, then at the start of a word, then anywhere')
+is(matches('ab', { 'xaxb', 'xabx' }), { 'xabx', 'xaxb' }, 'characters together before the same characters apart')
+is(matches('lib', { 'a/l/i/b', 'zlib' }), { 'zlib', 'a/l/i/b' },
+  'even when apart they each start a word')
+is(matches('a', { 'cca', 'da' }), { 'da', 'cca' }, 'of the same score, the shorter first')
+is(matches('a', { 'xa', 'ya' }), { 'xa', 'ya' }, 'and of the same length, in list order')
+is(matches('README', { 'readme.txt', 'x' }), { 'readme.txt' }, 'case is ignored')
+is(matches('init lua', { 'init/lua.c', 'lua/init.c', 'lua/x.c' }), { 'init/lua.c', 'lua/init.c' },
+  'the words of a query match in any order')
+is(lua([[return require('editable-file-search.match').positions('init/init', 'init')]]), { 5, 6, 7, 8 },
+  'a word that matches in the directory and the file name is taken as matching the file name')
+
+describe('while the files are still being listed')
+-- A command that takes its time
+ex([[let g:editable_file_search_command = ['sh', '-c', 'sleep 1; exec rg --files --no-messages "$@"', 'sh'] ]])
+wait_for_lists = false
+ex('FILESEARCH')
+is(lines(), { '' }, 'there are no results yet')
+is(labels()[4], 'Results: Loading…', 'the summary says so')
+type('init')
+is(lines(), { 'init' }, 'the query can be typed meanwhile, and still no results')
+wait_for_lists = true
+settle()
+is(lines(), vim.list_extend({ 'init' }, matches('init')), 'once the list is in, the results are written for the query typed')
+is(mode(), 'i', 'still in Insert mode')
+is(call('nvim_win_get_cursor', 0), { 1, 4 }, 'with the cursor where it was')
+type('<Esc>u')
+is(lines(), vim.list_extend({ '' }, all), 'u takes back the query, to every file')
+is(labels()[3], 'Query: ', 'not narrowed')
+
+describe(':CHANGEFLAGS clears the results until the new list is in')
+wait_for_lists = false
+ex('CHANGEFLAGS --no-ignore')
+is(lines(), { '' }, 'they go at once')
+is(labels()[4], 'Results: Loading…', 'Loading…')
+ok(labels()[5]:find('--no-ignore', 1, true), 'under the new flags  [' .. labels()[5] .. ']')
+type('ggAtxt')
+wait_for_lists = true
+settle()
+is(results(), matches('txt', unignored), 'then the results come, from the new list, for the query typed meanwhile')
+type('<Esc>u')
+is(query(), 'txt', 'undo starts over when they go')
+
+describe('closing a search while it lists its files')
+wait_for_lists = false
+ex('FILESEARCH')
+local listing = call('nvim_get_current_buf')
+ex('edit README.md')
+ex('bdelete ' .. listing)
+vim.wait(1500)
+wait_for_lists = true
+is(call('nvim_get_vvar', 'errmsg'), '', 'nothing goes wrong when the list would have come in')
+ex('unlet g:editable_file_search_command')
+
+describe('results come a page at a time')
+local big = vim.fn.tempname()
+vim.fn.mkdir(big, 'p')
+local many = {}
+for i = 1, 2345 do
+  many[i] = ('%04d.txt'):format(i)
+  vim.fn.writefile({}, big .. '/' .. many[i])
+end
+ex('cd ' .. vim.fn.fnameescape(big))
+ex('FILESEARCH')
+type('<Esc>')
+is(results(), vim.list_slice(many, 1, 1000), 'the first 1,000')
+is(labels()[4], 'Results: first 1,000 of all 2,345 files in ' .. vim.fn.fnamemodify(big, ':~')
+  .. '   :MORE shows more · <CR> opens · :NARROW {text} narrows fuzzily', 'the summary says there are more')
+is(labels()[3], 'Query: ', 'which is not narrowed')
+ex('MORE')
+is(results(), vim.list_slice(many, 1, 2000), ':MORE adds the next page')
+is(labels()[3], 'Query: ', 'still not narrowed')
+ex('MORE')
+is(results(), many, 'and the last, with what is left')
+ok(labels()[4]:find('^Results: all 2,345 files'), 'which is all of them  [' .. labels()[4] .. ']')
+ex('MORE')
+is(results(), many, 'after which there are no more')
+type('u')
+is(results(), vim.list_slice(many, 1, 2000), 'u takes back a page')
+type('uGdd')
+is(labels()[3], 'Query (Note: NARROWED): ', 'a page cut short is narrowed')
+ex('MORE')
+is(results(), vim.list_extend(vim.list_slice(many, 1, 999), vim.list_slice(many, 1001, 2000)),
+  ':MORE then adds the page after it, and what was taken out stays out')
+ex('2MORE')
+is(results(), vim.list_extend(vim.list_slice(many, 1, 999), vim.list_slice(many, 1001, 2345)), 'a count adds that many')
+type('ggA1<Esc>')
+local ones = matches('1', many)
+is(results(), vim.list_slice(ones, 1, 1000), 'a query writes the first page of its matches')
+ok(labels()[4]:find('^Results: first 1,000 of ' .. count_of(#ones) .. ' matches among 2,345 files'),
+  'and says how many there are  [' .. labels()[4] .. ']')
+ex('cd ' .. vim.fn.fnameescape(work))
+
 describe('no errors along the way')
 is(call('nvim_get_vvar', 'errmsg'), '', 'v:errmsg is empty')
 
 vim.fn.jobstop(job)
 vim.fn.delete(work, 'rf')
 vim.fn.delete(session)
+vim.fn.delete(big, 'rf')
 out('')
 out(pass .. ' passed, ' .. fail .. ' failed')
 os.exit(fail == 0 and 0 or 1)
