@@ -126,8 +126,12 @@ its |jumplist| entries dropped along with it. The name is also what lets it
 survive |:mksession|: entering a search buffer restored from a session sets it
 up as a fresh search of that directory, with the default flags.
 
-Line 1 is always the query. Deleting it makes the first result the query,
-which searches for that path; `u` puts it back.
+Line 1 is always the query: it can be emptied, but not deleted. Deleting it
+with an operator -- `dd`, `dj`, `dG`, `Vd` -- leaves it empty, as `cc` would,
+and so searches every file again. Deleting it with an Ex command -- `:g`, `:v`,
+`:d` -- leaves it as it was, since those are for narrowing the results:
+`:v/lua/d` catches the query whenever it doesn't say "lua" itself. Anything
+deleted along with it stays deleted. `u` puts it all back.
 
 The search runs inside Neovim, on every key typed into the query. That is
 instant for a project, but on a very large tree (a home directory, say, with

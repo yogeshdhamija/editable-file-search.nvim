@@ -8,8 +8,9 @@
 -- Changing line 1 runs the query over the whole file list again and redraws
 -- the results. Nothing else is ever redrawn, so the results can be whittled
 -- down by hand -- dd, :g/foo/d, :v/foo/d, :NARROW -- and stay that way until
--- the query changes. Undo and redo are taken as they come: they put back text
--- that was right at the time, narrowing included (see M.sync).
+-- the query changes. Line 1 itself can be emptied but not deleted: deleting
+-- it puts it back (see M.sync). Undo and redo are taken as they come: they put
+-- back text that was right at the time, narrowing included.
 --
 -- The file list comes from a command and some flags. :CHANGEFLAGS lists the
 -- files again with other flags, in the same buffer, and starts the results
@@ -46,6 +47,8 @@ local default_prompts = {
 --   query    the query the results were last drawn for
 --   matches  the results that query gives, before any narrowing
 --   seq_last, seq_cur  the undo state as of the last sync, to tell undo from edits
+--   query_deleted  'operator' or 'command' once a change has deleted line 1,
+--                  until the next sync puts it back
 local state = {}
 
 -- A command or a flag is a list of words, taken as they are, or a string,
@@ -305,7 +308,25 @@ local function remember_undo_state(buf)
   state[buf].seq_last, state[buf].seq_cur = tree.seq_last, tree.seq_cur
 end
 
+-- Puts back line 1 after a change deleted it, reading {text}. A buffer always
+-- has a line, so deleting every line leaves one empty line, which is then all
+-- there is of the query line.
+local function restore_query(buf, text)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local everything = #lines == 1 and lines[1] == ''
+  if not (everything and text == '') then
+    vim.api.nvim_buf_set_lines(buf, 0, everything and 1 or 0, false, { text })
+  end
+end
+
 -- Brings the results and labels in line with the text, after any change.
+--
+-- Line 1 can't be deleted, only emptied. Deleted with an operator -- dd, dj,
+-- dG, Vd -- it comes back empty, as cc would leave it: the cursor was on the
+-- query, and taking it away means clearing it. Deleted by an Ex command --
+-- :g/test/d, :v/lua/d -- it comes back as it was, since those are for
+-- narrowing the results, and catch the query only because it doesn't happen
+-- to match. Anything deleted along with it stays deleted.
 --
 -- A new edit to line 1 redraws the results for the new query. Undo and redo
 -- don't, even when they change line 1: they restore the results that went
@@ -323,9 +344,19 @@ function M.sync(buf)
   if not st then
     return
   end
-  local query = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ''
   local tree = vim.fn.undotree(buf)
   local undoing = tree.seq_last == st.seq_last and tree.seq_cur ~= st.seq_cur
+  -- Undo and redo delete line 1 too, putting back text from before it was
+  --   there; that is theirs to do
+  local deleted = st.query_deleted
+  st.query_deleted = nil
+  if deleted and not undoing then
+    restore_query(buf, deleted == 'operator' and '' or st.query)
+    if deleted == 'operator' and vim.api.nvim_get_current_buf() == buf then
+      vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    end
+  end
+  local query = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ''
   if query ~= st.query then
     st.query = query
     st.matches = match(st.files, query)
@@ -484,7 +515,8 @@ function M.setup(buf)
     fail(err)
     files = {}
   end
-  state[buf] = { root = root, command = cmd, flags = flags, files = files, query = '', matches = files }
+  local st = { root = root, command = cmd, flags = flags, files = files, query = '', matches = files }
+  state[buf] = st
 
   -- Kept out of undo: the first text isn't an edit, and u should never be
   --   able to empty the buffer
@@ -492,6 +524,26 @@ function M.setup(buf)
   vim.bo[buf].undolevels = -1
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend({ '' }, files))
   vim.bo[buf].undolevels = undolevels
+
+  -- Notes when line 1 is deleted, for M.sync to put back. TextChanged comes
+  --   too late to tell: by then the first result has moved up into its place,
+  --   which reads the same as the query edited to say that path. on_lines
+  --   comes with each change, and says which lines went: here, a run of lines
+  --   from the top with nothing in their place. It can't change the buffer
+  --   itself, so it only takes note.
+  vim.api.nvim_buf_attach(buf, false, {
+    on_lines = function(_, _, _, first, _, new_last)
+      -- Set up afresh since, or unloaded
+      if state[buf] ~= st then
+        return true
+      end
+      if first == 0 and new_last == 0 then
+        -- An operator is still under way while it deletes; an Ex command isn't
+        local operator = st.query_deleted == 'operator' or vim.fn.state('o') ~= ''
+        st.query_deleted = operator and 'operator' or 'command'
+      end
+    end,
+  })
 
   local group = vim.api.nvim_create_augroup('EditableFileSearch' .. buf, {})
   vim.api.nvim_create_autocmd({ 'TextChanged', 'TextChangedI' }, {
