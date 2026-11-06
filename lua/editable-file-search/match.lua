@@ -94,6 +94,10 @@ end
 -- luv takes only the function's code across. Returns the text, the lowercased
 -- text, and how many lines.
 function M.sort_lines(stdout)
+  -- On Windows, a command may end its lines with \r\n
+  if stdout:find('\r', 1, true) then
+    stdout = stdout:gsub('\r\n', '\n')
+  end
   -- find, as gmatch takes four times as long
   local lines, n, pos = {}, 0, 1
   while pos <= #stdout do

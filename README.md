@@ -4,7 +4,7 @@ Fuzzy file search in a plain, editable Neovim buffer. Type a query and the resul
 
 ```
 Query (Note: NARROWED): init
-Command: rg --files --no-messages --hidden --glob=!.git/ --follow   change with :CHANGEFLAGS
+Command: rg --files --no-messages --hidden --glob=!.git/   change with :CHANGEFLAGS
 Results: 2 left of 9 matches among 4,210 files in ~/Stuff   u undoes · editing the query starts over
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 .config/nvim/init.vim

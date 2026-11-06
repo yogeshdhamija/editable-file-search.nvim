@@ -65,7 +65,7 @@ local all = {
   'plugin/init.vim',
   'we#ird %name.txt',
 }
-local default_command = 'rg --files --no-messages --hidden --glob=!.git/ --follow'
+local default_command = 'rg --files --no-messages --hidden --glob=!.git/'
 -- {list} with {extra} added, sorted, as a file list is
 local function plus(list, extra)
   local out = vim.list_extend(vim.deepcopy(list), extra)
@@ -486,6 +486,43 @@ is({ labels()[5], results() }, was, 'the flags and results are as they were')
 ok(call('nvim_get_vvar', 'errmsg'):find('unrecognized flag %-%-bogus'),
   'and rg says why  [' .. call('nvim_get_vvar', 'errmsg') .. ']')
 call('nvim_set_vvar', 'errmsg', '')
+
+describe('a listing with no end is stopped')
+-- The flags are left to sh, where they go unused. exec, so that stopping
+-- the listing stops yes, not just the sh that started it.
+local endless = [[let g:editable_file_search_command = ['sh', '-c', 'exec yes endless', 'sh'] ]]
+ex(endless)
+ex('FILESEARCH')
+type('<Esc>')
+local errmsg = call('nvim_get_vvar', 'errmsg')
+ok(errmsg:find('too many files: stopped listing them at 256 MB', 1, true), 'past 256 MB, with an error  [' .. errmsg .. ']')
+is(lines(), { '' }, 'a new search has no files then')
+ok(labels()[4]:find('^Results: all 0 files'), 'and says so  [' .. labels()[4] .. ']')
+ex('unlet g:editable_file_search_command')
+ex('FILESEARCH')
+type('<Esc>')
+ex(endless)
+ex('CHANGEFLAGS --no-ignore')
+is({ labels()[5], results() }, { command_label(default_command), all },
+  ':CHANGEFLAGS goes back to the command, flags and files it had')
+ex('unlet g:editable_file_search_command')
+call('nvim_set_vvar', 'errmsg', '')
+
+describe('symlinks are not followed, unless asked')
+local linked = vim.fn.tempname()
+vim.fn.mkdir(linked .. '/outside', 'p')
+vim.fn.mkdir(linked .. '/here', 'p')
+vim.fn.writefile({}, linked .. '/outside/far.txt')
+vim.fn.writefile({}, linked .. '/here/near.txt')
+assert(vim.uv.fs_symlink('../outside', linked .. '/here/away'))
+ex('cd ' .. vim.fn.fnameescape(linked .. '/here'))
+ex('FILESEARCH')
+type('<Esc>')
+is(results(), { 'near.txt' }, 'a link out of the directory is left out')
+ex('CHANGEFLAGS --follow')
+is(results(), { 'away/far.txt', 'near.txt' }, ':CHANGEFLAGS --follow follows it')
+ex('cd ' .. vim.fn.fnameescape(work))
+vim.fn.delete(linked, 'rf')
 
 describe('the command and the flag prompts can be set')
 ex([[let g:editable_file_search_command = 'rg --files']])

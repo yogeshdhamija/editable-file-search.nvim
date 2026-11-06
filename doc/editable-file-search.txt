@@ -29,7 +29,7 @@ require('editable-file-search').open([{query}])
 The buffer looks like this: >
 
 	Query: init nvim
-	Command: rg --files --no-messages --hidden --glob=!.git/ --follow
+	Command: rg --files --no-messages --hidden --glob=!.git/
 	Results: 2 matches among 4,210 files in ~/Stuff   <CR> opens · ...
 	──────────────────────────────────────────────────────────────────
 	.config/nvim/init.vim
@@ -170,7 +170,11 @@ The search runs inside Neovim, on every key typed into the query. That is
 instant for a project; on a very large tree (a home directory, say, with
 hundreds of thousands of files) each key takes up to a tenth of a second or
 so, less as the query gets longer. Listing a tree that large can take a
-while, but only the search waits for it.
+while, but only the search waits for it. A listing past 256 MB of paths -- a
+couple of million files -- is stopped, as more than a search can take, and
+counts as the command failing: the error is shown, and a new search has no
+files, while |:CHANGEFLAGS| goes back to the ones it had. Following symlinks
+(--follow) out of the directory is the usual way to get there.
 
 					*g:editable_file_search_command*
 The command that lists the files, before any flags: a list of words, or a
@@ -184,13 +188,14 @@ without a shell, and should print one path per line, relative to it.
 The flags |:CHANGEFLAGS| asks about, in this order, and whether a new search
 has each: a list of dictionaries, each with a "flag", given the way the
 command is, and a "default", |v:true| or 1 for a new search to have the flag.
-The default lists hidden files, follows symlinks, and leaves out the inside of
-.git directories: >
+The default lists hidden files and leaves out the inside of .git directories.
+It doesn't follow symlinks: one out of the directory can lead anywhere
+(Wine's `z:` leads to /), and the listing then never ends: >
 	let g:editable_file_search_flag_prompts = [
 		\ {'flag': '--hidden',      'default': v:true},
 		\ {'flag': '--glob=!.git/', 'default': v:true},
 		\ {'flag': '--no-ignore',   'default': v:false},
-		\ {'flag': '--follow',      'default': v:true},
+		\ {'flag': '--follow',      'default': v:false},
 		\ ]
 <
 These are rg's flags, so for another command, set both. For git's tracked

@@ -42,14 +42,23 @@ local PAGE = 1000
 local default_command = { 'rg', '--files', '--no-messages' }
 
 -- The flags :CHANGEFLAGS asks about, in this order, and whether a new search
--- starts with them: hidden files and symlinks in, but not the inside of .git,
--- which --hidden would otherwise let in too.
+-- starts with them: hidden files in, but not the inside of .git, which
+-- --hidden would otherwise let in too. Symlinks aren't followed: one out of
+-- the directory can lead anywhere -- Wine's z: leads to / -- and the listing
+-- then goes on until it hits MAX_LISTING.
 local default_prompts = {
   { flag = '--hidden', default = true },
   { flag = '--glob=!.git/', default = true },
   { flag = '--no-ignore', default = false },
-  { flag = '--follow', default = true },
+  { flag = '--follow', default = false },
 }
+
+-- The most output listing the files can come to, and the listing is stopped
+-- past it. Without it, a listing with no end in sight would be kept in
+-- memory until there was none left. Paths average around a hundred bytes:
+-- this is room for a couple of million, twice a big home directory, while a
+-- search over even that many already takes a good part of a second a key.
+local MAX_LISTING = 256 * 1024 * 1024
 
 -- Keyed by buffer number:
 --   root     the directory searched; results are relative to it
@@ -191,12 +200,18 @@ local function echo(msg)
   vim.api.nvim_echo({ { msg } }, false, {})
 end
 
+local function kill(job)
+  if job.process then
+    -- Gone already, if it was only being sorted
+    pcall(job.process.kill, job.process, 15)
+  end
+end
+
 -- Stops the listing under way, if any. Whatever it was still to call back
 -- with finds st.job changed, and is dropped.
 local function stop(st)
-  if st.job and st.job.process then
-    -- Gone already, if it was only being sorted
-    pcall(st.job.process.kill, st.job.process, 15)
+  if st.job then
+    kill(st.job)
   end
   st.job = nil
 end
@@ -219,13 +234,36 @@ local function list_files(buf, st, done)
     end)
   end
 
+  -- The output is kept here, not by vim.system, which would keep all of it
+  --   until the command was gone, stopped or not, and then join it into one
+  --   string: past 2 GB, more than LuaJIT can hold, and that brings nvim
+  --   down. Here it's dropped as soon as the listing is stopped, or comes to
+  --   more than MAX_LISTING, which stops it.
+  local chunks, size, failed = {}, 0, nil
+  local function read(err, data)
+    if st.job ~= job or failed then
+      chunks = nil
+    elseif err or (data and size + #data > MAX_LISTING) then
+      failed = err or ('too many files: stopped listing them at %d MB of paths.'
+        .. ' Following symlinks (--follow) can lead out of the directory'):format(MAX_LISTING / 2 ^ 20)
+      chunks = nil
+      kill(job)
+    elseif data then
+      chunks[#chunks + 1], size = data, size + #data
+    end
+  end
+
   local argv = vim.list_extend(vim.deepcopy(st.command), st.flags)
-  -- vim.system throws, rather than returning an error, when argv[1] isn't installed
-  local ok, process = pcall(vim.system, argv, { cwd = st.root, text = true }, function(result)
+  -- vim.system throws, rather than returning an error, when argv[1] isn't
+  --   installed. text is for stderr; stdout's \r\n are left to sort_lines.
+  local ok, process = pcall(vim.system, argv, { cwd = st.root, text = true, stdout = read }, function(result)
     if st.job ~= job then
       return
+    elseif failed then
+      return finish(failed)
     end
-    local stdout = result.stdout or ''
+    local stdout = table.concat(chunks)
+    chunks = nil
     -- Failed only if it listed nothing and says why: rg exits 1 when there
     --   are no files at all, and 2 when it listed what it could but couldn't
     --   read some directory -- which --no-messages keeps quiet about
