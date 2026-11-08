@@ -272,12 +272,12 @@ local function list_files(buf, st, done)
   stop(st)
   local job = {}
   st.job = job
-  local function finish(err, text, lower, n)
+  local function finish(list, err)
     -- Called back outside the main loop, where buffers can't be changed
     vim.schedule(function()
       if st.job == job and state[buf] == st then
         st.job = nil
-        done(not err and match.list(text, lower, n) or nil, err)
+        done(list, err)
       end
     end)
   end
@@ -303,31 +303,37 @@ local function list_files(buf, st, done)
 
   local argv = vim.list_extend(vim.deepcopy(st.command), st.flags)
   -- vim.system throws, rather than returning an error, when argv[1] isn't
-  --   installed. text is for stderr; stdout's \r\n are left to sort_lines.
+  --   installed. text is for stderr; stdout's \r\n are left to match.load.
   local ok, process = pcall(vim.system, argv, { cwd = st.root, text = true, stdout = read }, function(result)
     if st.job ~= job then
       return
     elseif failed then
-      return finish(failed)
+      return finish(nil, failed)
     end
-    local stdout = table.concat(chunks)
+    local output = chunks
     chunks = nil
     -- Failed only if it listed nothing and says why: rg exits 1 when there
     --   are no files at all, and 2 when it listed what it could but couldn't
     --   read some directory -- which --no-messages keeps quiet about
     local err = vim.trim(result.stderr or '')
-    if result.code ~= 0 and not stdout:find('[^\n]') and err ~= '' then
-      return finish(err)
+    if result.code ~= 0 and err ~= '' then
+      local listed = false
+      for _, chunk in ipairs(output) do
+        listed = listed or chunk:find('[^\n]') ~= nil
+      end
+      if not listed then
+        return finish(nil, err)
+      end
     end
     -- Sorted because rg walks the tree in parallel, so its order changes
     --   from run to run, and ties in the ranking go by list order. Sorting
     --   a big list takes a moment, so that is done in a thread of its own.
-    vim.uv.new_work(match.sort_lines, function(text, lower, n)
-      finish(nil, text, lower, n)
-    end):queue(stdout)
+    --   The output goes to it as it came in, as joining it up here would
+    --   hold nvim up.
+    match.load(output, finish)
   end)
   if not ok then
-    finish('could not run ' .. tostring(argv[1]) .. ': ' .. process)
+    finish(nil, 'could not run ' .. tostring(argv[1]) .. ': ' .. process)
   else
     job.process = process
   end

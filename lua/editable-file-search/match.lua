@@ -6,9 +6,11 @@
 -- and, for more than that, able to run in a thread of its own (see
 -- M.search_async), so that typing never waits on it.
 --
--- A list is held as one string, every path in it ended by a newline, plus a
--- lowercased copy and where each path starts. Matching walks the bytes of the
--- lowercased copy in place: no string per path, and nothing copied to
+-- A list is held as one run of bytes, every path in it ended by a newline,
+-- plus a lowercased copy and where each path starts: memory of its own, not
+-- Lua strings, so that the thread that sorts the list can hand it over
+-- without the main thread copying it (see M.load). Matching walks the bytes
+-- of the lowercased copy in place: no string per path, and nothing copied to
 -- Vimscript and back, as matchfuzzy() would need on every key. Its scoring
 -- is simpler than matchfuzzy()'s too, which scores every way a path could
 -- match to find the best.
@@ -188,59 +190,186 @@ end
 local C = core()
 local code = string.dump(core)
 
--- Sorts the lines of {stdout} and joins them up, each ended by a newline;
--- and lowercases that too. Run in a thread of its own (vim.uv.new_work), as
--- it takes a moment for a big list, so it must use nothing from outside it:
--- luv takes only the function's code across. Returns the text, the lowercased
--- text, and how many lines.
-function M.sort_lines(stdout)
-  -- On Windows, a command may end its lines with \r\n
-  if stdout:find('\r', 1, true) then
-    stdout = stdout:gsub('\r\n', '\n')
+-- What a list is held in is allocated with malloc by sort_lines, in a worker
+-- thread, and freed here, on the main one. ffi declarations belong to a Lua
+-- state, so each thread has to make its own, and something else may have
+-- made them already, which is an error.
+pcall(ffi.cdef, 'void free(void *);')
+
+-- Sorts the lines of a command's output, joins them up, each ended by a
+-- newline, lowercases that too, and finds where each line starts. Run in a
+-- thread of its own (vim.uv.new_work), as it takes a moment for a big list,
+-- so it must use nothing from outside it: luv takes only the function's
+-- code across, and only numbers and strings as arguments. So the output
+-- comes as where it is, as {nchunks} pieces: the address of an array of a
+-- pointer to each and its length. They're read where they are, and must be
+-- kept until this is done.
+--
+-- What it makes is allocated with malloc and handed over as addresses, for
+-- the caller to free: the text, the lowercased text, where each line starts
+-- (int32_t, with one more for where a line after the last would), and how
+-- many lines. Nothing, and why, if it failed.
+function M.sort_lines(chunks, nchunks)
+  local ffi = require('ffi')
+  for _, declaration in ipairs({ 'void *malloc(size_t);', 'void free(void *);', 'void *memchr(const void *, int, size_t);' }) do
+    pcall(ffi.cdef, declaration)
   end
-  -- find, as gmatch takes four times as long
-  local lines, n, pos = {}, 0, 1
-  while pos <= #stdout do
-    local newline = stdout:find('\n', pos, true) or #stdout + 1
-    if newline > pos then
-      n = n + 1
-      lines[n] = stdout:sub(pos, newline - 1)
+  local C = ffi.C
+  local allocated = {}
+  local function allocate(ctype, count)
+    local p = C.malloc(math.max(count, 1) * ffi.sizeof(ctype))
+    if p == nil then
+      error('out of memory', 0)
     end
-    pos = newline + 1
+    allocated[#allocated + 1] = p
+    return ffi.cast(ctype .. ' *', p)
   end
-  table.sort(lines)
-  local text = n > 0 and table.concat(lines, '\n') .. '\n' or ''
+  local function address(p)
+    return tonumber(ffi.cast('uintptr_t', p))
+  end
+
+  local ok, text, lower, starts, n = pcall(function()
+    -- The output in one piece, as a line can be split between two
+    local pieces = ffi.cast('const uint64_t *', chunks)
+    local size = 0
+    for c = 0, nchunks - 1 do
+      size = size + tonumber(pieces[2 * c + 1])
+    end
+    local output = allocate('uint8_t', size)
+    local at = 0
+    for c = 0, nchunks - 1 do
+      local length = tonumber(pieces[2 * c + 1])
+      ffi.copy(output + at, ffi.cast('const uint8_t *', pieces[2 * c]), length)
+      at = at + length
+    end
+
+    local lines, n, total, pos = {}, 0, 0, 0
+    while pos < size do
+      local newline = C.memchr(output + pos, 10, size - pos)
+      local stop = newline ~= nil and ffi.cast('const uint8_t *', newline) - output or size
+      local e = stop
+      -- On Windows, a command may end its lines with \r\n
+      if newline ~= nil and e > pos and output[e - 1] == 13 then
+        e = e - 1
+      end
+      if e > pos then
+        n = n + 1
+        lines[n] = ffi.string(output + pos, e - pos)
+        total = total + e - pos + 1
+      end
+      pos = stop + 1
+    end
+    C.free(table.remove(allocated))
+    table.sort(lines)
+
+    local text, lower, starts = allocate('uint8_t', total), allocate('uint8_t', total), allocate('int32_t', n + 1)
+    at = 0
+    for i = 1, n do
+      local line = lines[i]
+      starts[i - 1] = at
+      ffi.copy(text + at, line, #line)
+      at = at + #line
+      text[at] = 10
+      at = at + 1
+    end
+    starts[n] = at
+    -- ASCII only, as string.lower, which lowercases the query
+    local lowered = ffi.new('uint8_t[256]')
+    for c = 0, 255 do
+      lowered[c] = (c >= 65 and c <= 90) and c + 32 or c
+    end
+    for i = 0, total - 1 do
+      lower[i] = lowered[text[i]]
+    end
+    return address(text), address(lower), address(starts), n
+  end)
   -- Whatever this leaves behind stays in the thread's Lua state until that
   --   allocates enough to collect it, which an idle thread never does: for a
-  --   big list, hundreds of MB. So the output and the paths are collected now.
-  --   What it returns is left behind all the same: see work.
-  stdout, lines = nil, nil
+  --   big list, hundreds of MB of paths. So it's collected now.
   collectgarbage()
-  return text, text:lower(), n
+  if not ok then
+    for _, p in ipairs(allocated) do
+      C.free(p)
+    end
+    return nil, nil, nil, nil, tostring(text)
+  end
+  return text, lower, starts, n
 end
 
--- A list from what sort_lines returns.
-function M.list(text, lower, n)
-  local starts = ffi.new('int32_t[?]', n + 1)
-  local p = ffi.cast('const uint8_t *', text)
-  local i = 1
-  for pos = 0, #text - 1 do
-    if p[pos] == 10 then
-      starts[i] = pos + 1
-      i = i + 1
-    end
+local function address(pointer)
+  return pointer and ffi.cast('uint64_t', ffi.cast('uintptr_t', pointer)) or 0
+end
+
+-- {strings} as sort_lines takes them: an array of where each is and how long
+-- it is. The strings must be kept for as long as it is used, and it too.
+local function pieces(strings)
+  local array = ffi.new('uint64_t[?]', math.max(2 * #strings, 1))
+  for i, s in ipairs(strings) do
+    array[2 * i - 2], array[2 * i - 1] = address(ffi.cast('const char *', s)), #s
   end
-  -- The pointer into lower is good for as long as lower is kept
-  return { n = n, text = text, lower = lower, p = ffi.cast('const uint8_t *', lower), starts = starts }
+  return array
+end
+
+-- Takes over memory at {address} that sort_lines allocated: freed once
+-- nothing refers to the pointer this returns. Not a pointer to const, which
+-- free() won't take, and an error in a finalizer is only printed.
+local function own(ctype, address)
+  return ffi.gc(ffi.cast(ctype, ffi.cast('uintptr_t', address)), ffi.C.free)
+end
+
+-- A list from what sort_lines returns, and nil and why if that failed.
+local function list_of(text, lower, starts, n, err)
+  if not text then
+    return nil, err
+  end
+  -- The list is all that refers to these, so it must be kept for as long as
+  --   anything reads them: see running
+  return {
+    n = n,
+    text = own('char *', text),
+    p = own('uint8_t *', lower),
+    starts = own('int32_t *', starts),
+  }
+end
+
+-- A list of the lines in {output}, a command's output -- as one string, or
+-- as a list of the pieces it came in -- sorted here and now. See M.load for
+-- doing that in the background. Nil and why if it failed.
+function M.list(output)
+  local strings = type(output) == 'string' and { output } or output
+  local array = pieces(strings)
+  local list, err = list_of(M.sort_lines(tonumber(ffi.cast('uintptr_t', array)), #strings))
+  -- Here until sort_lines is done with them
+  strings, array = nil, nil
+  return list, err
 end
 
 function M.empty()
-  return M.list('', '', 0)
+  return M.list({})
+end
+
+-- As M.list, in a worker thread, and calls done(list), or done(nil, why),
+-- back outside the main loop, where buffers can't be changed. The worker
+-- reads {output} where it is, so only addresses are passed: handing it, or
+-- the list it makes, over as strings would copy them on the main thread, and
+-- for a big list that holds nvim up for a good part of a second.
+function M.load(output, done)
+  local array = pieces(output)
+  vim.uv
+    .new_work(M.sort_lines, function(...)
+      -- Kept until here, as the worker reads them; and then let go of, in
+      --   case a compiled trace keeps this function (see release in
+      --   editable-file-search.lua)
+      output, array = nil, nil
+      done(list_of(...))
+    end)
+    :queue(tonumber(ffi.cast('uintptr_t', array)), #output)
 end
 
 -- Path i of the list, counted from 0
 function M.path(list, i)
-  return list.text:sub(list.starts[i] + 1, list.starts[i + 1] - 1)
+  local s = list.starts[i]
+  return ffi.string(list.text + s, list.starts[i + 1] - s - 1)
 end
 
 local function words(query)
@@ -318,9 +447,9 @@ local function work(bytecode, id, query, delay, slots)
       loaded = { bytecode = bytecode, C = loadstring(bytecode)() }
       _G.editable_file_search_match = loaded
     end
-    -- Garbage left in this thread's Lua state by an earlier job, such as
-    --   the list sort_lines returned, which a search would take a long while
-    --   to allocate enough to collect. A search itself leaves a few MB.
+    -- Garbage left in this thread's Lua state by an earlier job, which a
+    --   search would take a long while to allocate enough to collect. A
+    --   search itself leaves a few MB, and sort_lines collects its own.
     if collectgarbage('count') > 64 * 1024 then
       collectgarbage()
     end
@@ -341,10 +470,6 @@ local function work(bytecode, id, query, delay, slots)
 end
 
 local SLOTS = 7
-
-local function address(pointer)
-  return pointer and ffi.cast('uint64_t', ffi.cast('uintptr_t', pointer)) or 0
-end
 
 -- Searches still running, by id. Each keeps what its thread reads and writes
 -- alive until the thread is done with it, cancelled or not.

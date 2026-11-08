@@ -176,7 +176,7 @@ local function matches(q, list)
   return lua([[
     local match = require('editable-file-search.match')
     local lines, q = ...
-    local result = match.search(match.list(match.sort_lines(table.concat(lines, '\n'))), q)
+    local result = match.search(match.list(table.concat(lines, '\n')), q)
     local out = {}
     for r = 1, result.count do
       out[r] = match.ranked(result, r)
@@ -715,10 +715,57 @@ is(matches('lib', { 'a/l/i/b', 'zlib' }), { 'zlib', 'a/l/i/b' },
 is(matches('a', { 'cca', 'da' }), { 'da', 'cca' }, 'of the same score, the shorter first')
 is(matches('a', { 'xa', 'ya' }), { 'xa', 'ya' }, 'and of the same length, in list order')
 is(matches('README', { 'readme.txt', 'x' }), { 'readme.txt' }, 'case is ignored')
+is(matches('readme', { 'README.txt', 'x' }), { 'README.txt' }, 'in the paths too')
 is(matches('init lua', { 'init/lua.c', 'lua/init.c', 'lua/x.c' }), { 'init/lua.c', 'lua/init.c' },
   'the words of a query match in any order')
 is(lua([[return require('editable-file-search.match').positions('init/init', 'init')]]), { 5, 6, 7, 8 },
   'a word that matches in the directory and the file name is taken as matching the file name')
+
+describe('the file list, from what the command wrote')
+-- The paths of the list made of {pieces}, here and in the background
+is(lua([[
+  local match = require('editable-file-search.match')
+  local pieces = ...
+  local function paths(list)
+    local out = {}
+    for i = 0, list.n - 1 do
+      out[#out + 1] = match.path(list, i)
+    end
+    return out
+  end
+  local got = { paths(match.list(pieces)) }
+  match.load(pieces, function(list, err)
+    got[2] = list and paths(list) or err
+  end)
+  vim.wait(3000, function()
+    return got[2] ~= nil
+  end, 10)
+  return got
+]], { 'b\r\nc', '\r', '\nA\n\n\r\nd/e', '\r' }), { { 'A', 'b', 'c', 'd/e\r' }, { 'A', 'b', 'c', 'd/e\r' } },
+  'is sorted, without empty lines, and lines end at \\n or \\r\\n, even split between the pieces it came in')
+is(lua([[
+  local match = require('editable-file-search.match')
+  local list = match.list('')
+  return { list.n, match.search(list, 'a').count, match.empty().n }
+]]), { 0, 0, 0 }, 'and can be empty')
+-- How much less memory nvim holds once a list of 40 MB of paths is let go
+--   of: the list's own memory isn't Lua's, so only freeing it gives it back
+is(lua([[
+  local match = require('editable-file-search.match')
+  local paths = {}
+  for i = 1, 100000 do
+    paths[i] = ('%06d'):format(i) .. ('x'):rep(393)
+  end
+  local list = match.list(table.concat(paths, '\n'))
+  paths = nil
+  collectgarbage()
+  collectgarbage()
+  local before = vim.uv.resident_set_memory()
+  list = nil
+  collectgarbage()
+  collectgarbage()
+  return (before - vim.uv.resident_set_memory()) / 2 ^ 20 > 60
+]]), true, 'and its memory is given back once it is let go of')
 
 describe('a result holds no more than twice what it found')
 -- How many paths a search found, and how many its arrays have room for, here
@@ -729,7 +776,7 @@ is(lua([[
   for i = 1, 100 do
     paths[#paths + 1] = 'x' .. i
   end
-  local list = match.list(match.sort_lines(table.concat(paths, '\n')))
+  local list = match.list(table.concat(paths, '\n'))
   local function sizes(result)
     return { result.count, ffi.sizeof(result.found) / 4, ffi.sizeof(result.ranking) / 4 }
   end
