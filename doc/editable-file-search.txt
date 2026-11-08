@@ -61,6 +61,14 @@ then in the order of the file list, which is sorted. The characters each
 visible result matched on are highlighted, and its directory dimmed, so that
 the file name stands out (see |editable-file-search-highlights|).
 
+A search that would take more than a few milliseconds -- the first keys of a
+query over a very large tree -- runs in the background, so that typing never
+waits for it. The results go as soon as the query changes, the "Results:" line
+says "Searching…", and they are written all at once when it's done: never the
+old query's results under the new one, and never part of them. <CR>,
+|:NARROW| and |:MORE| wait for a search under way, so that they act on its
+results.
+
 The results are written a page of 1,000 at a time, so that a query matching
 most of a very large tree doesn't fill the buffer with all of it. When there
 are more, the "Results:" line says "first 1,000 of" how many; |:MORE| adds
@@ -77,6 +85,15 @@ many are left. Editing the query starts over from every file again.
 one narrowing. Undo puts back the results as they were at that point, rather
 than searching afresh, so undoing an edit to the query brings back any
 narrowing that edit threw away. `CTRL-R` redoes.
+
+A query's results go in the same undo step as the edit to it, even when they
+come from a search in the background. A step left before its search was done
+-- a second edit made faster than the search, or `u` pressed before it was
+done -- has none, and undoing back to it marks the query "Query (Note: SEARCH
+CANCELLED):" rather than showing no matches; editing the query runs it again.
+It isn't run again by itself, as writing the results there would be a change
+of its own, and cut off `CTRL-R`. The one exception is the newest step, where
+there is nothing to cut off: redo back to it, and its search runs to the end.
 
 						*:NARROW*
 :NARROW {text}		Keep only the results that fuzzy-match {text}, in
@@ -152,8 +169,9 @@ window. They stay listed until |:bdelete|d.
 The buffer is 'buftype' nofile and 'bufhidden' hide: there is nothing to
 save, and it is kept rather than wiped when hidden, because a wiped buffer has
 its |jumplist| entries dropped along with it. The name is also what lets it
-survive |:mksession|: entering a search buffer restored from a session sets it
-up as a fresh search of that directory, with the default flags.
+survive |:mksession|: a search buffer restored from a session, whether it was
+in a window or hidden, comes back as a fresh search of that directory, with
+the default flags.
 
 Line 1 is always the query: it can be emptied, but not deleted. Deleting it
 with an operator -- `dd`, `dj`, `dG`, `Vd` -- leaves it empty, as `cc` would,
@@ -166,11 +184,12 @@ A new search starts from the empty query and every file: `u` takes back a
 query typed, or given to |:FILESEARCH|, while the files were being listed, as
 it would one typed after.
 
-The search runs inside Neovim, on every key typed into the query. That is
-instant for a project; on a very large tree (a home directory, say, with
-hundreds of thousands of files) each key takes up to a tenth of a second or
-so, less as the query gets longer. Listing a tree that large can take a
-while, but only the search waits for it. A listing past 256 MB of paths -- a
+The search runs inside Neovim, on every key typed into the query. For a
+project it is instant, and done there and then. On a very large tree (a home
+directory, say, with a million files) it takes a fifth of a second or so,
+less as the query gets longer, and runs in the background (see above), so
+that keys never wait for it. Listing a tree that large can take a while, but
+only the search waits for it. A listing past 256 MB of paths -- a
 couple of million files -- is stopped, as more than a search can take, and
 counts as the command failing: the error is shown, and a new search has no
 files, while |:CHANGEFLAGS| goes back to the ones it had. Following symlinks
@@ -214,7 +233,8 @@ The colors come from these groups, each linked by default to the one shown
 				"Results:"
 	FileSearchText		the command and counts	Normal
 				after them
-	FileSearchNarrowed	"(Note: NARROWED)"	WarningMsg
+	FileSearchNarrowed	"(Note: NARROWED)",	WarningMsg
+				"(Note: SEARCH CANCELLED)"
 	FileSearchSummary	the hints after those	Comment
 	FileSearchSeparator	the rule under them	Comment
 	FileSearchDirectory	each result's directory	Comment

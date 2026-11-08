@@ -22,6 +22,11 @@
 -- deleting it puts it back (see M.sync). Undo and redo are taken as they
 -- come: they put back text that was right at the time, narrowing included.
 --
+-- A search that would take a while runs in the background, so that typing
+-- never waits on it; its results go in the same undo step as the edit to the
+-- query, whenever they come, and an undo step whose search never finished is
+-- labeled as such rather than passed off as results (see M.sync and refresh).
+--
 -- The labels ("Query:", the command, the result counts, the rule under them)
 -- are extmarks, not text, so they can't be edited, deleted or yanked, or read
 -- back as a path.
@@ -30,12 +35,29 @@ local match = require('editable-file-search.match')
 
 local M = {}
 
+-- For tests: delay holds up every background search by that many ms, and
+-- sync_limit, if set, takes the place of SYNC_LIMIT
+M._testing = { delay = 0, sync_limit = nil }
+
 local scheme = 'filesearch://'
 local ns = vim.api.nvim_create_namespace('editable-file-search')
 local match_ns = vim.api.nvim_create_namespace('editable-file-search-match')
 
 -- Results are written a page at a time
 local PAGE = 1000
+
+-- A search through up to this many paths is done there and then, when the
+-- query changes, rather than in the background: it takes a few ms at most,
+-- and the results never go blank for it. Typing on narrows the paths left to
+-- search, so on a big list only the first few keys search in the background.
+local SYNC_LIMIT = 20000
+
+-- Results of searches are kept, a few, so that undo and backspace find the
+-- counts they need, and typing on searches only the paths the query before
+-- found: at most this many, and as many matches between them, but always the
+-- newest
+local KEEP = 32
+local KEEP_MATCHES = 4000000
 
 -- The part of the command :CHANGEFLAGS leaves alone. --files has rg list the
 -- files rather than search them.
@@ -65,8 +87,13 @@ local MAX_LISTING = 256 * 1024 * 1024
 --   command, flags  what lists the files, as lists of words
 --   list     every file under root, sorted (see match.lua); nil while listing
 --   job      the listing under way, if any (see list_files)
---   query    the query the results were last drawn for
---   result   the matches for that query (see match.search); nil while listing
+--   search   the search under way in the background, if any: its query, and
+--            a function that cancels it (see request)
+--   found    results of searches done, oldest first (see recall)
+--   query    line 1 as of the last sync
+--   unfilled undo states whose results went for a new query and haven't been
+--            written since, keyed as undo_state() has them (see M.sync)
+--   base_seq the sequence number undo was last cleared at (see undo_state)
 --   seq_last, seq_cur  the undo state as of the last sync, to tell undo from edits
 --   query_deleted  'operator' or 'command' once a change has deleted line 1,
 --                  until the next sync puts it back
@@ -216,6 +243,14 @@ local function stop(st)
   st.job = nil
 end
 
+-- Cancels the search under way in the background, if any
+local function cancel(st)
+  if st.search then
+    st.search.cancel()
+  end
+  st.search = nil
+end
+
 -- Lists the files under st.root with st.command and st.flags, in the
 -- background, and calls done(list), or done(nil, why) if the command failed,
 -- once it has them. Not if listed again, or unloaded, by then: st.job is the
@@ -322,12 +357,53 @@ local function page(result, from, to)
   return lines
 end
 
--- A change made with 'undolevels' at -1 clears undo (:help clear-undo)
+-- undotree(), which builds all of the tree, a millisecond's work for a
+-- thousand steps: so it's only asked again once the text has changed, as it
+-- does with every edit, undo and redo
+local function undo_tree(buf)
+  local st, tick = state[buf], vim.b[buf].changedtick
+  if st.tree_tick ~= tick then
+    st.tree, st.tree_tick = vim.fn.undotree(buf), tick
+  end
+  return st.tree
+end
+
+local function remember_undo_state(buf)
+  local tree = undo_tree(buf)
+  state[buf].seq_last, state[buf].seq_cur = tree.seq_last, tree.seq_cur
+end
+
+-- The undo state the buffer is in, as a key for st.unfilled, and the undo
+-- tree. The state undo starts from goes by two numbers: the sequence number
+-- there was when undo was cleared, and 0 once undone back to.
+local function undo_state(buf)
+  local st, tree = state[buf], undo_tree(buf)
+  return tree.seq_cur == st.base_seq and 0 or tree.seq_cur, tree
+end
+
+-- Makes the changes {fn} makes with undo cleared, and kept out of it: a
+-- change made with 'undolevels' at -1 clears undo (:help clear-undo). The
+-- states it knew of go with it.
 local function without_undo(buf, fn)
   local undolevels = vim.bo[buf].undolevels
   vim.bo[buf].undolevels = -1
   fn()
   vim.bo[buf].undolevels = undolevels
+  state[buf].unfilled = {}
+  state[buf].base_seq = undo_tree(buf).seq_cur
+end
+
+-- Does {fn}, keeping the cursor of every window on the buffer where it was:
+-- writing over a line takes it to the start of the line.
+local function keeping_cursors(buf, fn)
+  local cursors = {}
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    cursors[win] = vim.api.nvim_win_get_cursor(win)
+  end
+  fn()
+  for win, cursor in pairs(cursors) do
+    pcall(vim.api.nvim_win_set_cursor, win, cursor)
+  end
 end
 
 local function count(n)
@@ -338,25 +414,148 @@ local function plural(n, one, many)
   return count(n) .. ' ' .. (n == 1 and one or many)
 end
 
+local function sync_limit()
+  return M._testing.sync_limit or SYNC_LIMIT
+end
+
+-- The result of searching for {query}, if there is one at hand: a query of no
+-- words needs no search, else one done before. Taken as the newest.
+local function recall(st, query)
+  if not searching(query) then
+    return match.search(st.list, query)
+  end
+  for i = #st.found, 1, -1 do
+    local result = st.found[i]
+    if result.query == query then
+      table.remove(st.found, i)
+      table.insert(st.found, result)
+      return result
+    end
+  end
+end
+
+local function keep(st, result)
+  if searching(result.query) then
+    table.insert(st.found, result)
+    local matches = 0
+    for i = #st.found, 1, -1 do
+      matches = matches + st.found[i].count
+      if i < #st.found and (#st.found - i >= KEEP or matches > KEEP_MATCHES) then
+        st.found = vim.list_slice(st.found, i + 1)
+        break
+      end
+    end
+  end
+end
+
+-- The result to search on from, for {query}: the one kept whose query
+-- {query} goes on from furthest, as that one found the fewest paths
+local function nearest(st, query)
+  local best
+  for _, result in ipairs(st.found) do
+    if query:sub(1, #result.query) == result.query and (not best or #result.query > #best.query) then
+      best = result
+    end
+  end
+  return best
+end
+
+-- The result for {query}: at hand, or searched for now if that's quick. Nil
+-- if it would take a while (see SYNC_LIMIT).
+local function quick(st, query)
+  local result = recall(st, query)
+  if not result then
+    local prev = nearest(st, query)
+    if match.cost(st.list, query, prev) <= sync_limit() then
+      result = match.search(st.list, query, prev)
+      keep(st, result)
+    end
+  end
+  return result
+end
+
+-- Searches for {query} in the background, unless that's under way already,
+-- and syncs once it's done, which takes it from there. Whatever search was
+-- under way before is cancelled: one at a time.
+local function request(buf, st, query)
+  if st.search and st.search.query == query then
+    return
+  end
+  cancel(st)
+  local search = { query = query }
+  st.search = search
+  search.cancel = match.search_async(st.list, query, nearest(st, query), function(result)
+    if st.search == search and state[buf] == st then
+      st.search = nil
+      keep(st, result)
+      M.sync(buf)
+    end
+  end, M._testing.delay)
+end
+
+-- Whether the buffer is in an undo state whose results went for a new query
+-- and haven't come back, but still can: the newest state, where writing them
+-- joins the change that is in it rather than making one of its own, and with
+-- nothing written in their place since. Undo can't take a state anywhere
+-- else back to, and writing there would be a new change, cutting off redo,
+-- so such a state stays as it is, and is labeled as such.
+local function fillable(buf, st)
+  local key, tree = undo_state(buf)
+  return st.unfilled[key] and tree.seq_cur == tree.seq_last and vim.api.nvim_buf_line_count(buf) == 1
+end
+
+-- Writes the first page of {result} into the undo state the buffer is in,
+-- in place of no results (see fillable).
+local function fill(buf, st, result)
+  local key, tree = undo_state(buf)
+  local lines = page(result, 1, PAGE)
+  if #tree.entries == 0 then
+    -- Nothing to join: written into undo, it would be a step of its own
+    without_undo(buf, function()
+      vim.api.nvim_buf_set_lines(buf, 1, -1, false, lines)
+    end)
+  else
+    -- :undojoin, because a change made once the edit has been taken as an
+    --   undo step (leaving Insert mode, or a key in Normal mode) would be a
+    --   step of its own. That opens the step again, so it is then shut, as
+    --   it was, or the next change would join it too -- unless the query is
+    --   still being typed into it.
+    local typing = vim.api.nvim_get_mode().mode:find('^[iR]') and vim.api.nvim_get_current_buf() == buf
+    local ok = pcall(vim.api.nvim_buf_call, buf, function()
+      vim.cmd('undojoin')
+      vim.api.nvim_buf_set_lines(buf, 1, -1, false, lines)
+      if not typing then
+        -- Setting 'undolevels', even to what it is, ends the undo step
+        vim.bo[buf].undolevels = vim.bo[buf].undolevels
+      end
+    end)
+    if not ok then
+      return
+    end
+    st.unfilled[key] = nil
+  end
+  remember_undo_state(buf)
+end
+
 -- Whether the results are anything other than the first pages of what the
 -- query gives -- however they got that way: :NARROW, dd, :g/foo/d, a paste,
 -- or undoing back to any of those. The first pages are whole ones, but for
 -- the last, which has what is left.
-local function narrowed(st, shown)
-  local n, total = #shown, st.result.count
+local function narrowed(result, shown)
+  local n, total = #shown, result.count
   if n ~= total and (n == 0 or n > total or n % PAGE ~= 0) then
     return true
   end
   for r = 1, n do
-    if shown[r] ~= match.ranked(st.result, r) then
+    if shown[r] ~= match.ranked(result, r) then
       return true
     end
   end
   return false
 end
 
-local function summary(st, shown, cut)
-  local n, total = #shown, st.result.count
+local function summary(st, result, shown, cut)
+  local n, total = #shown, result.count
   local files = plural(st.list.n, 'file', 'files') .. ' in ' .. vim.fn.fnamemodify(st.root, ':~')
   local from
   if not searching(st.query) then
@@ -382,17 +581,35 @@ local function command_line(st)
   end, vim.list_extend(vim.deepcopy(st.command), st.flags)), ' ')
 end
 
--- Redraws the labels from what the buffer says now.
+local function note(text)
+  return { { 'Query', 'FileSearchLabel' }, { ' (Note: ' .. text .. ')', 'FileSearchNarrowed' }, { ': ', 'FileSearchLabel' } }
+end
+
+-- Redraws the labels from what the buffer says now. Never more than is
+-- known: no counts until the query is searched for, and a state whose search
+-- never finished says so, rather than no matches.
 local function decorate(buf)
   local st = state[buf]
   local label, text, hint = { { 'Query: ', 'FileSearchLabel' } }, 'Loading…', ''
   if st.list then
-    local shown = results(buf)
-    local cut = narrowed(st, shown)
-    if cut then
-      label = { { 'Query', 'FileSearchLabel' }, { ' (Note: NARROWED)', 'FileSearchNarrowed' }, { ': ', 'FileSearchLabel' } }
+    local result = recall(st, st.query)
+    if st.unfilled[undo_state(buf)] then
+      if fillable(buf, st) then
+        text = 'Searching…'
+      else
+        label = note('SEARCH CANCELLED')
+        text, hint = 'not shown: the search was cancelled before it finished', '   edit the query to run it'
+      end
+    elseif not result then
+      text = 'Counting matches…'
+    else
+      local shown = results(buf)
+      local cut = narrowed(result, shown)
+      if cut then
+        label = note('NARROWED')
+      end
+      text, hint = summary(st, result, shown, cut)
     end
-    text, hint = summary(st, shown, cut)
   end
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   vim.api.nvim_buf_set_extmark(buf, ns, 0, 0, {
@@ -419,9 +636,41 @@ local function decorate(buf)
   vim.bo[buf].modified = false
 end
 
-local function remember_undo_state(buf)
-  local tree = vim.fn.undotree(buf)
-  state[buf].seq_last, state[buf].seq_cur = tree.seq_last, tree.seq_cur
+-- Brings the results in line with the query wherever that can be done
+-- without a change of its own -- writing them into the undo state they went
+-- from (see fillable), searched for now if that's quick, or once a search in
+-- the background is done -- and finds the counts the labels need. Then
+-- redraws the labels.
+local function refresh(buf)
+  local st = state[buf]
+  if st.list then
+    if fillable(buf, st) then
+      local result = quick(st, st.query)
+      if result then
+        fill(buf, st, result)
+      else
+        request(buf, st, st.query)
+      end
+    elseif not st.unfilled[undo_state(buf)] and not quick(st, st.query) then
+      request(buf, st, st.query)
+    end
+  end
+  decorate(buf)
+end
+
+-- Waits for the search under way in the background, if any, so that what
+-- comes next sees its results. False if interrupted, with CTRL-C.
+local function finish_search(buf)
+  local st = state[buf]
+  if st and st.search then
+    if not vim.wait(24 * 60 * 60 * 1000, function()
+      return st.search == nil or state[buf] ~= st
+    end, 10) then
+      echo('Interrupted')
+      return false
+    end
+  end
+  return true
 end
 
 -- Puts back line 1 after a change deleted it, reading {text}. A buffer always
@@ -444,17 +693,26 @@ end
 -- narrowing the results, and catch the query only because it doesn't happen
 -- to match. Anything deleted along with it stays deleted.
 --
--- A new edit to line 1 redraws the results for the new query. Undo and redo
--- don't, even when they change line 1: they restore the results that went
--- with that query at the time, which may have been narrowed since, and
--- redrawing them would throw that away -- and, being a new change, would cut
--- off redo as well. The two are told apart by the undo tree: an edit adds an
--- undo entry, or (typing on in Insert mode) extends the newest one, but undo
--- and redo only move seq_cur along the existing entries.
+-- A new edit to line 1 takes away the results, and writes them for the new
+-- query once it's searched for: there and then if that's quick, else when a
+-- search in the background is done (see refresh). Undo and redo don't, even
+-- when they change line 1: they restore the results that went with that
+-- query at the time, which may have been narrowed since, and redrawing them
+-- would throw that away -- and, being a new change, would cut off redo as
+-- well. The two are told apart by the undo tree: an edit adds an undo entry,
+-- or (typing on in Insert mode) extends the newest one, but undo and redo
+-- only move seq_cur along the existing entries.
 --
--- The redraw needs no :undojoin to share an undo step with the edit that
--- caused it. TextChanged runs before nvim waits for the next key, and waiting
--- for a key is where undo steps are cut, so one u takes back both anyway.
+-- Taking the results away needs no :undojoin to share an undo step with the
+-- edit that caused it. TextChanged runs before nvim waits for the next key,
+-- and waiting for a key is where undo steps are cut, so one u takes back both
+-- anyway. Results that come later join that step themselves (see fill).
+--
+-- So every undo state has the results of its query, or results narrowed
+-- from them, or none at all because they hadn't come back by the time
+-- another change or an undo moved on from it: st.unfilled has those, and so
+-- does any change made on top of one, which has no more results than it did.
+-- The labels say which (see decorate).
 --
 -- While the files are still being listed, there are no results to redraw:
 -- the query is only taken note of, for when they are in.
@@ -463,7 +721,7 @@ function M.sync(buf)
   if not st then
     return
   end
-  local tree = vim.fn.undotree(buf)
+  local tree = undo_tree(buf)
   local undoing = tree.seq_last == st.seq_last and tree.seq_cur ~= st.seq_cur
   -- Undo and redo delete line 1 too, putting back text from before it was
   --   there; that is theirs to do
@@ -476,19 +734,18 @@ function M.sync(buf)
     end
   end
   local query = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ''
-  if query ~= st.query then
-    st.query = query
-    if st.list then
-      st.result = match.search(st.list, query, st.result)
-      if not undoing then
-        -- Written even when it comes out the same: nvim doesn't redraw lines
-        --   it sees as unchanged, so they'd keep the old query's highlights
-        vim.api.nvim_buf_set_lines(buf, 1, -1, false, page(st.result, 1, PAGE))
-      end
+  if st.list and not undoing then
+    local before = st.seq_cur == st.base_seq and 0 or st.seq_cur
+    if query ~= st.query then
+      set_results(buf, {})
+      st.unfilled[undo_state(buf)] = true
+    elseif st.unfilled[before] then
+      st.unfilled[undo_state(buf)] = true
     end
   end
+  st.query = query
   remember_undo_state(buf)
-  decorate(buf)
+  refresh(buf)
 end
 
 -- Writes the results once the file list is in, for whatever the query is by
@@ -501,34 +758,30 @@ end
 -- starts over at the results (see M.change_flags).
 local function loaded(buf, st, list, fresh)
   M.sync(buf)
-  st.list = list
-  st.result = match.search(list, st.query)
-  local lines = page(st.result, 1, PAGE)
-  if fresh and searching(st.query) then
-    -- Line 1 is written over, which takes the cursor of any window on it to
-    --   its start; each is put back where it was
-    local cursors = {}
-    for _, win in ipairs(vim.fn.win_findbuf(buf)) do
-      cursors[win] = vim.api.nvim_win_get_cursor(win)
+  st.list, st.found = list, {}
+  keeping_cursors(buf, function()
+    if fresh and searching(st.query) then
+      without_undo(buf, function()
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend({ '' }, page(match.search(list, ''), 1, PAGE)))
+      end)
+      -- Its results come as for any new query
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { st.query })
+    else
+      -- Line 1 too, written over as it is: without a change, undo isn't
+      --   cleared
+      without_undo(buf, function()
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, { st.query })
+      end)
     end
-    without_undo(buf, function()
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend({ '' }, page(match.search(list, ''), 1, PAGE)))
-    end)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend({ st.query }, lines))
-    for win, cursor in pairs(cursors) do
-      pcall(vim.api.nvim_win_set_cursor, win, cursor)
-    end
-  else
-    without_undo(buf, function()
-      vim.api.nvim_buf_set_lines(buf, 1, -1, false, lines)
-    end)
-  end
+  end)
+  -- Written by refresh, as for any new query
+  st.unfilled[undo_state(buf)] = true
   remember_undo_state(buf)
-  decorate(buf)
+  refresh(buf)
 end
 
 -- Opens the file named on the cursor line in this window. From the query
--- line, that is the top result.
+-- line, that is the top result: so it waits for the search under way, if any.
 function M.open_under_cursor()
   local buf = vim.api.nvim_get_current_buf()
   local st = state[buf]
@@ -538,6 +791,9 @@ function M.open_under_cursor()
   -- Typed ahead fast enough, the query can be changed with no TextChanged
   --   between it and this, leaving the results a query behind
   M.sync(buf)
+  if not finish_search(buf) then
+    return
+  end
   local row = math.max(vim.api.nvim_win_get_cursor(0)[1], 2)
   local line = vim.trim(vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or '')
   if line == '' then
@@ -558,8 +814,12 @@ function M.open_under_cursor()
 end
 
 -- Keeps only the results that fuzzy-match {text}, in the order they were in.
+-- Waits for the search under way first, if any, so as to narrow its results.
 function M.narrow(buf, text)
   M.sync(buf)
+  if not finish_search(buf) then
+    return
+  end
   set_results(buf, vim.tbl_filter(function(line)
     return match.positions(line, text) ~= nil
   end, results(buf)))
@@ -580,6 +840,14 @@ function M.more(buf, pages)
     echo('Still listing the files')
     return
   end
+  if not finish_search(buf) then
+    return
+  end
+  local result = recall(st, st.query)
+  if st.unfilled[undo_state(buf)] or not result then
+    echo('No results to add to: the search was cancelled. Edit the query to run it')
+    return
+  end
   local wanted, left = {}, 0
   for _, line in ipairs(results(buf)) do
     if not wanted[line] then
@@ -588,21 +856,21 @@ function M.more(buf, pages)
   end
   -- The furthest down the ranking of the results shown
   local last = 0
-  for r = 1, st.result.count do
+  for r = 1, result.count do
     if left == 0 then
       break
     end
-    local line = match.ranked(st.result, r)
+    local line = match.ranked(result, r)
     if wanted[line] then
       wanted[line], left, last = nil, left - 1, r
     end
   end
   local from = math.ceil(last / PAGE) * PAGE + 1
-  if from > st.result.count then
+  if from > result.count then
     echo('No more results')
     return
   end
-  vim.api.nvim_buf_set_lines(buf, -1, -1, false, page(st.result, from, from + pages * PAGE - 1))
+  vim.api.nvim_buf_set_lines(buf, -1, -1, false, page(result, from, from + pages * PAGE - 1))
   M.sync(buf)
 end
 
@@ -670,8 +938,9 @@ function M.change_flags(buf, args, bang)
   end
 
   M.sync(buf)
+  cancel(st)
   local was = { command = st.command, flags = st.flags, list = st.list }
-  st.command, st.flags, st.list, st.result = command(), flags, nil, nil
+  st.command, st.flags, st.list, st.found = command(), flags, nil, {}
   without_undo(buf, function()
     vim.api.nvim_buf_set_lines(buf, 1, -1, false, {})
   end)
@@ -707,10 +976,11 @@ function M.setup(buf)
 
   if state[buf] then
     stop(state[buf])
+    cancel(state[buf])
   end
   -- A search restored from a session starts with the default flags too: the
   --   name only says what directory it was of
-  local st = { root = root, command = command(), flags = default_flags(), query = '' }
+  local st = { root = root, command = command(), flags = default_flags(), query = '', found = {} }
   state[buf] = st
 
   -- Kept out of undo: the first text isn't an edit, and u should never be
@@ -761,6 +1031,7 @@ function M.setup(buf)
     buffer = buf,
     callback = function()
       stop(st)
+      cancel(st)
       state[buf] = nil
       vim.api.nvim_del_augroup_by_id(group)
     end,
@@ -797,6 +1068,16 @@ function M.setup(buf)
     end
     loaded(buf, st, list or match.empty(), true)
   end)
+end
+
+-- Sets up a buffer that has just been named filesearch://<n><dir> by :file,
+-- if it's empty, as a search: what a session does with a search that was in
+-- a window, since a 'nofile' buffer is no file it could :edit. A buffer with
+-- text in it is left alone, rather than have the text written over.
+function M.adopt(buf)
+  if not state[buf] and vim.api.nvim_buf_line_count(buf) == 1 and vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == '' then
+    M.setup(buf)
+  end
 end
 
 -- Starts a new search of the cwd in this window, prefilled with {query}.

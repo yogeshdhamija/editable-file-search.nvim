@@ -600,6 +600,30 @@ type('ggAinit')
 is(results(), matches('init'), 'and it searches')
 type('<Esc>')
 
+describe('a search restored from a session while it was in a window works')
+reset()
+ex('FILESEARCH init')
+type('<Esc>')
+-- A session makes such a buffer with :enew and :file, which reads nothing
+ex('mksession! ' .. vim.fn.fnameescape(session))
+ex('silent! %bwipeout!')
+ex('source ' .. vim.fn.fnameescape(session))
+is(name(), 'filesearch://1' .. work, 'the window has the search again')
+is(lines(), vim.list_extend({ '' }, all), 'as a working search, not an empty buffer')
+is(call('nvim_eval', '&buftype'), 'nofile', 'set up again')
+type('ggAinit')
+is(results(), matches('init'), 'and it searches')
+type('<Esc>')
+ex('enew')
+ex('file ' .. vim.fn.fnameescape('filesearch://9' .. work))
+is(lines(), vim.list_extend({ '' }, all), 'naming an empty buffer so by hand sets it up too')
+ex('enew')
+call('nvim_buf_set_lines', 0, 0, -1, false, { 'my text' })
+ex('file ' .. vim.fn.fnameescape('filesearch://8' .. work))
+is(lines(), { 'my text' }, 'but a buffer with text in it is left alone')
+ex('setlocal buftype=nofile')
+reset()
+
 describe('directories are dimmed, and matched characters highlighted over them')
 -- Colors no colorscheme has, to tell on screen which group drew a cell
 lua([[
@@ -740,6 +764,96 @@ is(results(), vim.list_slice(ones, 1, 1000), 'a query writes the first page of i
 ok(labels()[4]:find('^Results: first 1,000 of ' .. count_of(#ones) .. ' matches among 2,345 files'),
   'and says how many there are  [' .. labels()[4] .. ']')
 ex('cd ' .. vim.fn.fnameescape(work))
+
+-- Searches that would take a while run in the background. On these few
+-- files none would, so every search is made to: none is done there and then,
+-- and each takes 300 ms. The keys type() sends are 60 ms apart.
+local function slow_searches(on)
+  lua([[require('editable-file-search')._testing = ...]], on and { delay = 300, sync_limit = 0 } or { delay = 0 })
+end
+local searching_label = 'Results: Searching…'
+local function searched()
+  assert(vim.wait(3000, function() return labels()[4] ~= searching_label end, 10), 'the search never finished')
+end
+
+describe('a slow search runs in the background, and typing never waits for it')
+slow_searches(true)
+reset()
+ex('FILESEARCH')
+is(lines(), vim.list_extend({ '' }, all), 'the empty query needs no search')
+type('init')
+is(lines(), { 'init' }, 'the results go at once')
+is(labels()[4], searching_label, 'and the summary says it is searching')
+is(mode(), 'i', 'still typing')
+searched()
+is(results(), matches('init'), 'then the results come')
+is(labels()[3], 'Query: ', 'not narrowed')
+type('<Esc>u')
+is(lines(), vim.list_extend({ '' }, all), 'one u takes them back with the query')
+type('<C-r>')
+is(lines(), vim.list_extend({ 'init' }, matches('init')), 'and CTRL-R brings both back')
+
+describe('an undo step whose search never finished says so')
+type('gg$x')
+type('x')
+is(query(), 'in', 'two edits to the query, faster than a search')
+searched()
+is(results(), matches('in'), 'the second one gets its results')
+type('u')
+is(lines(), { 'ini' }, 'u goes back to the first, which never got any')
+is(labels()[3], 'Query (Note: SEARCH CANCELLED): ', 'and is marked so')
+is(labels()[4], 'Results: not shown: the search was cancelled before it finished   edit the query to run it',
+  'rather than claiming no matches')
+vim.wait(400)
+is(lines(), { 'ini' }, 'it stays that way: writing there would cut off redo')
+type('u')
+is(lines(), vim.list_extend({ 'init' }, matches('init')), 'u again goes on back')
+is(labels()[3], 'Query: ', 'to a state that has its results')
+type('<C-r><C-r>')
+is(lines(), vim.list_extend({ 'in' }, matches('in')), 'and redo still goes all the way forward')
+
+describe('undoing before a search is done, then redoing to it, finishes it')
+type('ggAd<Esc>u')
+is(lines(), vim.list_extend({ 'in' }, matches('in')), 'u takes the edit back at once')
+type('<C-r>')
+is(query(), 'ind', 'CTRL-R brings it back...')
+is(labels()[4], searching_label, '...still searching, as nothing came after it')
+searched()
+is(results(), matches('ind'), 'then its results come')
+type('u')
+is(lines(), vim.list_extend({ 'in' }, matches('in')), 'with undo')
+type('<C-r>')
+is(lines(), vim.list_extend({ 'ind' }, matches('ind')), 'and redo as they were')
+
+describe('a change on top of a search under way leaves it unfinished')
+ex('FILESEARCH')
+type('doc<Esc>ofoo<Esc>')
+vim.wait(400)
+is(lines(), { 'doc', 'foo' }, 'the line added is kept, and no results written over it')
+is(labels()[3], 'Query (Note: SEARCH CANCELLED): ', 'and that is what the labels say')
+
+-- While a command waits, nvim still answers requests, so a check made too
+-- soon would see the buffer as it was. Waits for {fn} to return {want}.
+local function eventually(fn, want, msg)
+  local got
+  vim.wait(3000, function()
+    got = fn()
+    return vim.deep_equal(got, want)
+  end, 20)
+  is(got, want, msg)
+end
+
+describe('<CR> and :NARROW wait for the search under way')
+ex('FILESEARCH')
+type('plugin<CR>')
+eventually(name, work .. '/' .. matches('plugin')[1], '<CR> opens the top result of the query typed')
+ex('FILESEARCH')
+type('lua')
+ex('NARROW init')
+eventually(results, { 'lua/init.lua' }, ':NARROW narrows the results of the query typed')
+type('u')
+eventually(results, matches('lua'), 'the results were written first: u takes back only the narrowing')
+slow_searches(false)
 
 describe('no errors along the way')
 is(call('nvim_get_vvar', 'errmsg'), '', 'v:errmsg is empty')

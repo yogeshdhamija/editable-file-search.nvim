@@ -28,6 +28,18 @@ vim.api.nvim_create_autocmd('BufReadCmd', {
   end,
 })
 
+-- A search that was in a window comes back from a session another way: the
+-- session makes an empty buffer and names it with :file, as it does for any
+-- 'nofile' buffer, since there is no file to :edit. That reads nothing, so
+-- the search is set up here instead.
+vim.api.nvim_create_autocmd('BufFilePost', {
+  group = group,
+  pattern = 'filesearch://*',
+  callback = function(ev)
+    require('editable-file-search').adopt(ev.buf)
+  end,
+})
+
 -- The labels are Identifier rather than Title, which nvim's own colorscheme
 -- makes the same color as the text, only bold. The text after them is left
 -- plain, and directories dimmed, so that the labels and file names stand out.
