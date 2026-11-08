@@ -54,8 +54,8 @@ local SYNC_LIMIT = 20000
 
 -- Results of searches are kept, a few, so that undo and backspace find the
 -- counts they need, and typing on searches only the paths the query before
--- found: at most this many, and as many matches between them, but always the
--- newest
+-- found: at most this many, and as many matches between them (which take
+-- at most twice that room: see trim in match.lua), but always the newest
 local KEEP = 32
 local KEEP_MATCHES = 4000000
 
@@ -249,6 +249,19 @@ local function cancel(st)
     st.search.cancel()
   end
   st.search = nil
+end
+
+-- Lets go of all a search holds, once its buffer is unloaded or set up
+-- afresh. Dropping it from state isn't enough. Whatever else still holds it
+-- (a callback yet to come, or a trace LuaJIT has compiled, which keeps every
+-- closure it calls until the trace is flushed) must hold an empty table, not
+-- the file list and the results kept.
+local function release(st)
+  stop(st)
+  cancel(st)
+  for key in pairs(st) do
+    st[key] = nil
+  end
 end
 
 -- Lists the files under st.root with st.command and st.flags, in the
@@ -659,7 +672,8 @@ local function refresh(buf)
 end
 
 -- Waits for the search under way in the background, if any, so that what
--- comes next sees its results. False if interrupted, with CTRL-C.
+-- comes next sees its results. False if interrupted, with CTRL-C, or if the
+-- buffer was unloaded meanwhile.
 local function finish_search(buf)
   local st = state[buf]
   if st and st.search then
@@ -669,6 +683,7 @@ local function finish_search(buf)
       echo('Interrupted')
       return false
     end
+    return state[buf] == st
   end
   return true
 end
@@ -975,8 +990,7 @@ function M.setup(buf)
   vim.bo[buf].path = (root:gsub('[, \\]', '\\%0'))
 
   if state[buf] then
-    stop(state[buf])
-    cancel(state[buf])
+    release(state[buf])
   end
   -- A search restored from a session starts with the default flags too: the
   --   name only says what directory it was of
@@ -989,6 +1003,7 @@ function M.setup(buf)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { '' })
   end)
 
+  local group = vim.api.nvim_create_augroup('EditableFileSearch' .. buf, {})
   -- Notes when line 1 is deleted, for M.sync to put back. TextChanged comes
   --   too late to tell: by then the first result has moved up into its place,
   --   which reads the same as the query edited to say that path. on_lines
@@ -1007,9 +1022,18 @@ function M.setup(buf)
         st.query_deleted = operator and 'operator' or 'command'
       end
     end,
+    -- Unloading (:bdelete) empties the buffer; entering it again reads it,
+    --   and so sets it up, afresh. Unloading detaches it, even with
+    --   autocommands off (:noautocmd), which BufUnload would miss.
+    on_detach = function()
+      if state[buf] == st then
+        state[buf] = nil
+        release(st)
+        pcall(vim.api.nvim_del_augroup_by_id, group)
+      end
+    end,
   })
 
-  local group = vim.api.nvim_create_augroup('EditableFileSearch' .. buf, {})
   vim.api.nvim_create_autocmd({ 'TextChanged', 'TextChangedI' }, {
     group = group,
     buffer = buf,
@@ -1024,19 +1048,6 @@ function M.setup(buf)
       decorate(buf)
     end,
   })
-  -- Unloading (:bdelete) empties the buffer; entering it again reads it, and
-  --   so sets it up, afresh
-  vim.api.nvim_create_autocmd('BufUnload', {
-    group = group,
-    buffer = buf,
-    callback = function()
-      stop(st)
-      cancel(st)
-      state[buf] = nil
-      vim.api.nvim_del_augroup_by_id(group)
-    end,
-  })
-
   vim.keymap.set('n', '<CR>', M.open_under_cursor, { buffer = buf, desc = 'Open file under cursor' })
   -- On the query line, Enter opens the top result, as in fzf. Anywhere else
   --   it's an ordinary Enter.

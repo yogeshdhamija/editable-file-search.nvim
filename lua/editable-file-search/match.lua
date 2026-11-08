@@ -210,6 +210,12 @@ function M.sort_lines(stdout)
   end
   table.sort(lines)
   local text = n > 0 and table.concat(lines, '\n') .. '\n' or ''
+  -- Whatever this leaves behind stays in the thread's Lua state until that
+  --   allocates enough to collect it, which an idle thread never does: for a
+  --   big list, hundreds of MB. So the output and the paths are collected now.
+  --   What it returns is left behind all the same: see work.
+  stdout, lines = nil, nil
+  collectgarbage()
   return text, text:lower(), n
 end
 
@@ -262,10 +268,25 @@ function M.cost(list, query, prev)
   return n
 end
 
+-- The first n entries of {array}, copied to an array of their own if that's
+-- at most half of it. A search writes to arrays with room for every path it
+-- goes through -- the whole list, for a search from scratch -- however few
+-- it finds, so a result that found nothing would otherwise hold as much as
+-- one that found everything. Trimmed, a result holds at most twice what it
+-- found, and the copy costs less than allocating the arrays did.
+local function trim(array, n)
+  if not array or ffi.sizeof(array) < n * 8 then
+    return array
+  end
+  local trimmed = ffi.new('int32_t[?]', n)
+  ffi.copy(trimmed, array, n * 4)
+  return trimmed
+end
+
 -- A result: how many paths matched (count) and, through M.ranked, which,
 -- best first. A query of no words matches every path, in list order.
 local function result(list, query, found, ranking, count)
-  return { list = list, query = query, found = found, ranking = ranking, count = count }
+  return { list = list, query = query, found = trim(found, count), ranking = trim(ranking, count), count = count }
 end
 
 local never = ffi.new('int32_t[1]')
@@ -296,6 +317,12 @@ local function work(bytecode, id, query, delay, slots)
     if not loaded or loaded.bytecode ~= bytecode then
       loaded = { bytecode = bytecode, C = loadstring(bytecode)() }
       _G.editable_file_search_match = loaded
+    end
+    -- Garbage left in this thread's Lua state by an earlier job, such as
+    --   the list sort_lines returned, which a search would take a long while
+    --   to allocate enough to collect. A search itself leaves a few MB.
+    if collectgarbage('count') > 64 * 1024 then
+      collectgarbage()
     end
     if delay > 0 then
       vim.uv.sleep(delay)

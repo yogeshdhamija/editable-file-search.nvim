@@ -593,6 +593,42 @@ is(results(), matches('lua'), 'and it searches')
 ex('buffer ' .. vim.fn.fnameescape('filesearch://1' .. work))
 is(lines(), vim.list_extend({ '' }, all), 'the closed one, entered again, is a fresh search')
 
+describe('closing a search lets go of all it held, autocommands or not')
+-- Keeps hold of the search's state, and a weak hold of its file list. A
+--   compiled trace can keep the state alive, so what counts is that it's
+--   emptied, and that nothing else holds the list.
+local function hold()
+  lua([[
+    local sync = require('editable-file-search').sync
+    for i = 1, math.huge do
+      local name, state = debug.getupvalue(sync, i)
+      if name == 'state' then
+        local st = state[vim.api.nvim_get_current_buf()]
+        _G.efs_held = { st = st, weak = setmetatable({ list = st.list }, { __mode = 'v' }) }
+        return
+      end
+    end
+  ]])
+end
+local function held()
+  return lua([[
+    collectgarbage()
+    collectgarbage()
+    return { next(_G.efs_held.st) == nil, _G.efs_held.weak.list == nil }
+  ]])
+end
+for _, close in ipairs({ 'bdelete', 'noautocmd bdelete', 'noautocmd bwipeout' }) do
+  ex('FILESEARCH lua')
+  local closing = call('nvim_get_current_buf')
+  hold()
+  ex('edit README.md')
+  ex(close .. ' ' .. closing)
+  is(held(), { true, true }, ':' .. close .. ' empties its state, and its file list is gone')
+end
+ex('doautocmd VimResized')
+is(call('nvim_get_vvar', 'errmsg'), '', 'and nothing is left behind to go wrong')
+lua('_G.efs_held = nil')
+
 describe('a search named before searches were numbered still works')
 ex('edit ' .. vim.fn.fnameescape('filesearch://' .. work))
 is(lines(), vim.list_extend({ '' }, all), 'as a search of that directory')
@@ -683,6 +719,30 @@ is(matches('init lua', { 'init/lua.c', 'lua/init.c', 'lua/x.c' }), { 'init/lua.c
   'the words of a query match in any order')
 is(lua([[return require('editable-file-search.match').positions('init/init', 'init')]]), { 5, 6, 7, 8 },
   'a word that matches in the directory and the file name is taken as matching the file name')
+
+describe('a result holds no more than twice what it found')
+-- How many paths a search found, and how many its arrays have room for, here
+--   and in the background, of 100 x paths and one y
+is(lua([[
+  local ffi, match = require('ffi'), require('editable-file-search.match')
+  local paths = { 'yz' }
+  for i = 1, 100 do
+    paths[#paths + 1] = 'x' .. i
+  end
+  local list = match.list(match.sort_lines(table.concat(paths, '\n')))
+  local function sizes(result)
+    return { result.count, ffi.sizeof(result.found) / 4, ffi.sizeof(result.ranking) / 4 }
+  end
+  local got = { sizes(match.search(list, 'yz')), sizes(match.search(list, 'q')), sizes(match.search(list, 'x')) }
+  match.search_async(list, 'yz', nil, function(result)
+    got[#got + 1] = sizes(result)
+  end)
+  vim.wait(3000, function()
+    return #got == 4
+  end, 10)
+  return got
+]]), { { 1, 1, 1 }, { 0, 0, 0 }, { 100, 101, 101 }, { 1, 1, 1 } },
+  'one that found few holds them alone, one that found most holds room for all, in the background too')
 
 describe('while the files are still being listed')
 -- A command that takes its time
