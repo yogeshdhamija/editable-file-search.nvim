@@ -1076,6 +1076,14 @@ function M.setup(buf)
   end, { nargs = '*', bang = true, desc = 'List the files again with other flags' })
 
   vim.bo[buf].filetype = 'filesearch'
+  -- The cursor's whole row highlighted, not just its number, as in oil. Set
+  --   as :setlocal does, so for this buffer alone: nvim keeps it with the
+  --   buffer, and a window that moves on to a file goes back to its own
+  --   (see |local-options|)
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    vim.wo[win][0].cursorline = true
+    vim.wo[win][0].cursorlineopt = 'both'
+  end
   remember_undo_state(buf)
   decorate(buf)
 
