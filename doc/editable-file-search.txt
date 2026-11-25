@@ -153,6 +153,10 @@ the directory searched, not the current directory, so they still open after
 a |:cd|; |gf| and CTRL-W_f work on them too. A line typed or pasted in as an
 absolute path opens as it is.
 
+A double-click on a result opens it too, from Normal or Insert mode.
+Anywhere else, the query line included, a double-click does what it always
+does.
+
 Opening a result is a jump, so CTRL-O comes back to the search with the
 cursor where it was and the results as they were. The search buffer is
 listed, so it shows in |:ls| and can be reached with |:buffer| as well.

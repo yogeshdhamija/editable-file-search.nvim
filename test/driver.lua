@@ -366,6 +366,60 @@ type('<C-o>')
 type('gg<CR>')
 is(name(), work .. '/' .. matches('finder')[1], 'so does Normal-mode <CR>')
 
+-- A double-click at screen row {row}, column {col}, as a hand makes one:
+-- down, up, down, up, a moment apart, all within 'mousetime'.
+local function double_click(row, col)
+  for _ = 1, 2 do
+    call('nvim_input_mouse', 'left', 'press', '', 0, row - 1, col - 1)
+    vim.wait(20)
+    call('nvim_input_mouse', 'left', 'release', '', 0, row - 1, col - 1)
+    vim.wait(20)
+  end
+  settle()
+end
+-- The screen row line {lnum} of the current window is drawn on
+local function row_of(lnum)
+  return call('nvim_eval', 'screenpos(win_getid(), ' .. lnum .. ', 1).row')
+end
+
+describe('a double-click on a result opens it, from either mode')
+ex('FILESEARCH init')
+type('<Esc>')
+res = results()
+search = call('nvim_get_current_buf')
+double_click(row_of(3), 3)
+is(name(), work .. '/' .. res[2], 'from Normal mode it opened the result clicked')
+type('<C-o>')
+type('i')
+double_click(row_of(2), 3)
+is(name(), work .. '/' .. res[1], 'and from Insert mode')
+is(mode(), 'n', 'leaving Insert mode')
+type('<C-o>')
+is(call('nvim_get_current_buf'), search, 'CTRL-O comes back')
+
+describe('a double-click anywhere else opens nothing')
+is(row_of(2), row_of(1) + 4, 'the header under the query takes three rows')
+for row = row_of(1) + 1, row_of(1) + 3 do
+  double_click(row, 3)
+  is(call('nvim_get_current_buf'), search, 'on header row ' .. row - row_of(1))
+  type('<Esc>')
+end
+double_click(row_of(#lines()) + 2, 3)
+is(call('nvim_get_current_buf'), search, 'past the last result')
+type('<Esc>')
+double_click(call('nvim_eval', 'winheight(0) + 1'), 3)
+is(call('nvim_get_current_buf'), search, 'on the status line')
+type('<Esc>')
+double_click(1, #'Query: ' + 2)
+is(call('nvim_get_current_buf'), search, 'on the query')
+is({ mode(), call('nvim_eval', "[col('v'), col('.')]") }, { 'v', { 1, #'init' } },
+  'which picks out the word clicked, as a double-click does')
+type('<Esc>')
+type('i')
+double_click(1, #'Query: ' + 2)
+is(call('nvim_get_current_buf'), search, 'nor on the query from Insert mode')
+type('<Esc>')
+
 describe('each :FILESEARCH is a search of its own')
 ex('FILESEARCH')
 local first = call('nvim_get_current_buf')

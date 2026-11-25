@@ -1063,6 +1063,24 @@ function M.setup(buf)
     end
     return '<CR>'
   end, { buffer = buf, expr = true, desc = 'Open top result from the query line' })
+  -- A double-click on a result opens it, as <CR> does, from either mode.
+  --   Anywhere else it's the usual double-click: on the query line, so a
+  --   word of it can be picked out, and on what isn't a line's own text,
+  --   which getmousepos() reports as a line nearby. That's the header under
+  --   the query (as the line below it), the ~ rows past the end (as the last
+  --   line), and the status line.
+  local function on_result()
+    local m = vim.fn.getmousepos()
+    return m.winid == vim.api.nvim_get_current_win() and m.line >= 2
+      and vim.fn.screenpos(m.winid, m.line, math.max(1, m.column)).row == m.screenrow
+  end
+  vim.keymap.set({ 'n', 'i' }, '<2-LeftMouse>', function()
+    if not on_result() then
+      return '<2-LeftMouse>'
+    end
+    return (vim.fn.mode() == 'i' and '<Esc>' or '')
+      .. '<Cmd>lua require("editable-file-search").open_under_cursor()<CR>'
+  end, { buffer = buf, expr = true, desc = 'Open the file double-clicked' })
   -- All capitals, so that a short abbreviation is less likely to be
   --   ambiguous (:help user-cmd-ambiguous)
   vim.api.nvim_buf_create_user_command(buf, 'NARROW', function(opts)
